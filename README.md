@@ -1,10 +1,10 @@
-# 💻 Softeer6th - team4 점심뭐먹지
-
-## Ground Rule
+# Softeer6th - team4 점심뭐먹지
    
-## Data Product  
+## 주제
+- 오토바이 단속을 위한 음향영상카메라 설치 위치 선정
 
 ## 문제 상황  
+- 
 
 ## 해결 방법  
 
