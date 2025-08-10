@@ -1,2 +1,34 @@
-# 4팀-점심뭐먹지
-소프티어 부트캠프 6기 최종 프로젝트 4팀-점심뭐먹지 레포지토리
+# 💻 Softeer6th - team4 점심뭐먹지
+
+## Ground Rule
+   
+## Data Product  
+
+## 문제 상황  
+
+## 해결 방법  
+
+## ETL 파이프라인
+
+
+## 👨‍💻 팀원 소개
+
+<br/>
+
+<div align="center">
+<table>
+<th>팀원</th>
+    <th> 노선우 <a href="https://github.com/sejjong"><br/><img src="https://img.shields.io/badge/Github-181717?style=flat-square&logo=Github&logoColor=white"/><a></th>
+	  <th> 김의진 <a href="http://github.com/bkindtoevery1"><br/><img src="https://img.shields.io/badge/Github-181717?style=flat-square&logo=Github&logoColor=white"/></a></th>
+    <th> 조원영 <a href="https://github.com/bjpark0925"><br/><img src="https://img.shields.io/badge/Github-181717?style=flat-square&logo=Github&logoColor=white"/></a></th>
+  </table>
+</div>
+<br />
+<br />
+
+
+---
+
+## 📂 프로젝트 정보
+
+- 기간: 2025.08.04 ~ 2025.08.30  
