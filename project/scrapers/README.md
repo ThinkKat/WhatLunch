@@ -1,0 +1,4 @@
+# Scrapers
+
+- daily
+- prev
