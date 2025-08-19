@@ -1,9 +1,10 @@
 # Softeer6th - team4 점심뭐먹지 
 
 ## 문제
-- 
+
 
 ## 해결 방법  
+
 
 ## ETL 파이프라인
 
@@ -16,7 +17,7 @@
 <table>
 <th>팀원</th>
     <th> 노선우 <a href="https://github.com/SsunyR"><br/><img src="https://img.shields.io/badge/Github-181717?style=flat-square&logo=Github&logoColor=white"/><a></th>
-	  <th> 김의진 <a href=""><br/><img src="https://img.shields.io/badge/Github-181717?style=flat-square&logo=Github&logoColor=white"/></a></th>
+	  <th> 김의진 <a href="https://github.com/uijinee"><br/><img src="https://img.shields.io/badge/Github-181717?style=flat-square&logo=Github&logoColor=white"/></a></th>
     <th> 조원영 <a href="https://github.com/ThinkKat"><br/><img src="https://img.shields.io/badge/Github-181717?style=flat-square&logo=Github&logoColor=white"/></a></th>
   </table>
 </div>
