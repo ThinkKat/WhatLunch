@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 python crawl.py \
     --start-date  2024-08-19 \
     --end-date    2025-08-20 \
-    --result      end
+    --mode        end
 """
 
 # =========================
@@ -35,6 +35,7 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Connection": "keep-alive",
 }
+
 
 # 경매결과 매핑
 RESULT_MAP = {
@@ -427,10 +428,12 @@ def parse_args():
     p = argparse.ArgumentParser(description="무료경매 차량 목록/상세 크롤러 (날짜/결과 인자)")
     p.add_argument("--start-date", required=True, help="시작일 (YYYY-MM-DD)")
     p.add_argument("--end-date",   required=True, help="종료일 (YYYY-MM-DD)")
-    p.add_argument("--result",     required=True, choices=["ongoing", "end", "total"],
+
+    p.add_argument("--mode",     required=True, choices=["ongoing", "end", "total"],
                    help="경매 결과 필터: ongoing|end|total")
     p.add_argument("--save_path",  required=False, help="저장 경로 (JSON 또는 CSV)")
-    p.add_argument("--workers", type=int, default=12,
+    p.add_argument("--workers", type=int, default=1,
+
                    help="동시 작업자 수 (기본: 12, 네트워크 I/O 기준으로 조정 가능)")
     return p.parse_args()
 
@@ -443,7 +446,7 @@ if __name__ == "__main__":
     sy, sm, sd = split_ymd(args.start_date)
     ey, em, ed = split_ymd(args.end_date)
 
-    auction_result_value = RESULT_MAP[args.result]
+    auction_result_value = RESULT_MAP[args.mode]
 
     # 목록 검색 payload 구성 (요청사항: 종료일 필드 포함)
     fetch_payload = {
@@ -501,13 +504,19 @@ if __name__ == "__main__":
             print("  ", u)
             
     # 3) 파일 저장
-    save_path = args.save_path or f"{args.result}_{args.start_date}_{args.end_date}.json"
+    save_path = args.save_path or f"{args.mode}_{args.start_date}_{args.end_date}.csv"
+
     save_path = "result/" + save_path
     if save_path.endswith(".json"):
         with open(save_path, "w", encoding="utf-8") as f:
             json.dump(all_results, f, ensure_ascii=False, indent=2)
     elif save_path.endswith(".csv"):
-        df = pd.DataFrame(all_results)
+        processed_data = []
+        for item in all_results:
+            cleaned_item = {k: v for k, v in item.items() if k != 'bid_history'}
+            processed_data.append(cleaned_item)
+        df = pd.DataFrame(processed_data)
+
         df.to_csv(save_path, index=False, encoding="utf-8-sig")
     else:
         print(f"[ERROR] Unsupported save format: {args.save_path}")
