@@ -428,10 +428,12 @@ def parse_args():
     p = argparse.ArgumentParser(description="무료경매 차량 목록/상세 크롤러 (날짜/결과 인자)")
     p.add_argument("--start-date", required=True, help="시작일 (YYYY-MM-DD)")
     p.add_argument("--end-date",   required=True, help="종료일 (YYYY-MM-DD)")
+
     p.add_argument("--mode",     required=True, choices=["ongoing", "end", "total"],
                    help="경매 결과 필터: ongoing|end|total")
     p.add_argument("--save_path",  required=False, help="저장 경로 (JSON 또는 CSV)")
     p.add_argument("--workers", type=int, default=1,
+
                    help="동시 작업자 수 (기본: 12, 네트워크 I/O 기준으로 조정 가능)")
     return p.parse_args()
 
@@ -503,6 +505,7 @@ if __name__ == "__main__":
             
     # 3) 파일 저장
     save_path = args.save_path or f"{args.mode}_{args.start_date}_{args.end_date}.csv"
+
     save_path = "result/" + save_path
     if save_path.endswith(".json"):
         with open(save_path, "w", encoding="utf-8") as f:
@@ -513,6 +516,7 @@ if __name__ == "__main__":
             cleaned_item = {k: v for k, v in item.items() if k != 'bid_history'}
             processed_data.append(cleaned_item)
         df = pd.DataFrame(processed_data)
+
         df.to_csv(save_path, index=False, encoding="utf-8-sig")
     else:
         print(f"[ERROR] Unsupported save format: {args.save_path}")
