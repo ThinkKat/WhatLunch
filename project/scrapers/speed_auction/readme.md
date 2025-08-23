@@ -68,3 +68,15 @@ python crawl.py \
 | `vin` | 차대번호(VIN, Vehicle Identification Number) |
 | `inspection_period` | 자동차 검사 유효기간 |
 | `notes` | 기타 참고사항, 비고 (사고 이력, 소유자 변경, 특이사항 등) |
+
+
+
+docker build -t speed-auction-crawler:latest .
+
+docker run --rm \
+  -v "$(pwd)/result:/app/result" \
+  speed-auction-crawler:latest \
+  --start-date 2025-08-19 \
+  --end-date   2025-08-20 \
+  --mode       end \
+  --workers    1
