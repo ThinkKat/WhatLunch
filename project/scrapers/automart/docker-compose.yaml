@@ -1,0 +1,10 @@
+services:
+  automart-auction-closed:
+    build:
+      context: .
+      dockerfile: daily/docker/closed/Dockerfile
+    image: automart-auction-closed:latest
+    container_name: automart-auction-closed
+    hostname: automart-auction-closed
+    tty: true
+    command: /bin/bash -c "source .venv/bin/activate && /app/automart/daily/closed/auction_daily_crawling_upload.sh"
