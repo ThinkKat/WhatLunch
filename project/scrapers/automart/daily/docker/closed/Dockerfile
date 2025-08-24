@@ -8,7 +8,6 @@ ENV TZ=Asia/Seoul \
 # 앱/브라우저 경로 준비 및 유저 생성
 RUN apt update && \
     apt install -y --no-install-recommends \
-        python3-venv \
         tzdata && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* && \
@@ -20,9 +19,9 @@ RUN apt update && \
 USER thinkcat
 WORKDIR /app
 
-RUN python3 -m venv .venv && \
-    .venv/bin/pip install bs4 playwright boto3 && \
-    .venv/bin/playwright install chromium
+RUN pip install --upgrade pip setuptools wheel && \
+    pip install boto3 bs4 playwright && \
+    python -m playwright install chromium
 
 COPY --chown=thinkcat:thinkcat . /app/automart/.
 
