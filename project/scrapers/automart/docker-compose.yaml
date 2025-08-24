@@ -7,4 +7,4 @@ services:
     container_name: automart-auction-closed
     hostname: automart-auction-closed
     tty: true
-    command: /bin/bash -c "source .venv/bin/activate && /app/automart/daily/closed/auction_daily_crawling_upload.sh"
+    entrypoint: ["/app/automart/daily/closed/auction_daily_crawling_upload.sh"]
