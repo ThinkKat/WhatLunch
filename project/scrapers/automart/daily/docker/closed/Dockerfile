@@ -21,7 +21,7 @@ USER thinkcat
 WORKDIR /app
 
 RUN python3 -m venv .venv && \
-    .venv/bin/pip install bs4 playwright && \
+    .venv/bin/pip install bs4 playwright boto3 && \
     .venv/bin/playwright install chromium
 
 COPY --chown=thinkcat:thinkcat . /app/automart/.
