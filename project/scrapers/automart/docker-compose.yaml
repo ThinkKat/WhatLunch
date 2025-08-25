@@ -7,4 +7,4 @@ services:
     container_name: automart-auction-closed
     hostname: automart-auction-closed
     tty: true
-    entrypoint: ["/app/automart/daily/closed/auction_daily_crawling_upload.sh"]
+    entrypoint: ["/app/automart/daily/closed/auction_daily_closed_crawling_upload.sh"]
