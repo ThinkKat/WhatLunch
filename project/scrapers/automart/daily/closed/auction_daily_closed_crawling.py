@@ -28,8 +28,8 @@ BASE_DIR = Path("./automart/daily/closed").resolve()
 URL_JSON = BASE_DIR / "auction_url_check_list.json"
 COMPLETE_JSON = BASE_DIR / f"complete_data_{DATE}.json"
 
-URL_SCRIPTS = BASE_DIR / "auction_daily_complete_crawling_auction_url_list.py"
-CAR_INFO_SCRIPT = BASE_DIR / "auction_daily_complete_crawling_car_info.py"
+URL_SCRIPTS = BASE_DIR / "auction_daily_closed_crawling_auction_url_list.py"
+CAR_INFO_SCRIPT = BASE_DIR / "auction_daily_closed_crawling_car_info.py"
 
 # === 설정 ===
 SLEEP_SEC_AFTER_CAR_INFO = 10       # car_info 스크립트 1회 실행 후 잠깐 쉼

@@ -2,7 +2,7 @@ services:
   automart-auction-closed:
     build:
       context: .
-      dockerfile: daily/docker/closed/Dockerfile
+      dockerfile: daily/docker/Dockerfile
     image: automart-auction-closed:latest
     container_name: automart-auction-closed
     hostname: automart-auction-closed
