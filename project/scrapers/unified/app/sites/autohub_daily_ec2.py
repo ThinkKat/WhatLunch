@@ -9,6 +9,12 @@ from playwright.async_api import (
     Error as PlaywrightError,
     TimeoutError as PlaywrightTimeoutError,
 )
+import logging
+
+# --- 로깅 설정 ---
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
 
 async def extract_data_from_page(page, yesterday_str):
@@ -25,6 +31,10 @@ async def extract_data_from_page(page, yesterday_str):
             'tbody.text-center.text_vert_midd tr[role="row"]'
         ).all()
 
+        if not rows:
+            logging.warning("현재 페이지에서 데이터 행을 찾을 수 없습니다.")
+            return [], False, False
+
         for row in rows:
             cols = await row.locator("td").all()
             if len(cols) != 7:
@@ -33,6 +43,9 @@ async def extract_data_from_page(page, yesterday_str):
             auction_date = await cols[0].inner_text()
 
             if auction_date != yesterday_str:
+                logging.info(
+                    f"어제({yesterday_str})와 다른 날짜({auction_date})의 데이터를 발견하여 수집을 중단합니다."
+                )
                 should_stop_globally = True
                 break
 
@@ -76,6 +89,7 @@ async def extract_data_from_page(page, yesterday_str):
 
     except PlaywrightError as e:
         if "Execution context was destroyed" in str(e):
+            logging.warning("페이지 이동 중 컨텍스트가 파괴되어 재시도합니다.")
             error_occurred = True
         else:
             raise e
@@ -94,21 +108,22 @@ async def main():
     try:
         yesterday = datetime.now() - timedelta(days=1)
         yesterday_str_for_compare = yesterday.strftime("%Y-%m-%d")
-        yesterday_str_for_filename = yesterday.strftime("%Y%m%d")
 
-        print(f"🔍 어제 날짜({yesterday_str_for_compare})의 경매 데이터를 수집합니다.")
+        logging.info(
+            f"🔍 어제 날짜({yesterday_str_for_compare})의 Autohub 경매 데이터를 수집합니다."
+        )
 
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
+            browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
             page = await browser.new_page()
 
-            print("🚀 페이지로 이동합니다: https://www.sellcarauction.co.kr/...")
+            logging.info("🚀 페이지로 이동합니다: https://www.sellcarauction.co.kr/...")
             await page.goto(
                 "https://www.sellcarauction.co.kr/newfront/successfulbid/sb/front_successfulbid_sb_list.do",
                 timeout=60000,
             )
 
-            print("✔️ '검색' 버튼을 클릭합니다.")
+            logging.info("✔️ '검색' 버튼을 클릭합니다.")
             await page.locator("a.button.btn_small.btn_search").click()
 
             await page.wait_for_selector(
@@ -122,7 +137,7 @@ async def main():
             MAX_RETRIES = 3
 
             while not stop_crawling:
-                print(f"\n--- 페이지 {page_num} 데이터 수집 시작 ---")
+                logging.info(f"--- 페이지 {page_num} 데이터 수집 시작 ---")
 
                 success_on_page = False
                 for attempt in range(MAX_RETRIES):
@@ -133,7 +148,7 @@ async def main():
                             timeout=10000,
                         )
                     except PlaywrightTimeoutError:
-                        print(
+                        logging.warning(
                             f"⚠️ 페이지 {page_num} 로딩 시간 초과. {attempt + 1}/{MAX_RETRIES}번째 재시도..."
                         )
                         await page.reload()
@@ -144,7 +159,7 @@ async def main():
                     )
 
                     if error_occurred:
-                        print(
+                        logging.warning(
                             f"⚠️ 페이지 {page_num}에서 데이터 추출 오류 발생. {attempt + 1}/{MAX_RETRIES}번째 재시도..."
                         )
                         await page.reload()
@@ -154,18 +169,20 @@ async def main():
                     break
 
                 if not success_on_page:
-                    print(
+                    logging.error(
                         f"❌ 페이지 {page_num} 데이터 수집에 {MAX_RETRIES}번 실패하여 크롤링을 중단합니다."
                     )
                     stop_crawling = True
 
                 if success_on_page and current_page_data:
                     all_car_data.extend(current_page_data)
-                    print(
+                    logging.info(
                         f"✔️ {len(current_page_data)}개 차량 정보 수집 완료. (총 {len(all_car_data)}개)"
                     )
                 elif success_on_page and not stop_crawling:
-                    print("⚠️ 현재 페이지에서 어제 날짜의 데이터를 찾지 못했습니다.")
+                    logging.warning(
+                        "⚠️ 현재 페이지에서 어제 날짜의 데이터를 찾지 못했습니다."
+                    )
 
                 if stop_crawling:
                     break
@@ -173,7 +190,9 @@ async def main():
                 try:
                     active_page_element = page.locator("ul.pagination li.active a")
                     if not await active_page_element.is_visible(timeout=5000):
-                        print("⭐ 페이지네이션을 찾을 수 없어 크롤링을 종료합니다.")
+                        logging.info(
+                            "⭐ 페이지네이션을 찾을 수 없어 크롤링을 종료합니다."
+                        )
                         break
 
                     current_page_num_text = await active_page_element.inner_text()
@@ -185,17 +204,19 @@ async def main():
                     )
 
                     if await next_page_button.is_visible():
-                        print(f"✔️ {next_page_num} 페이지로 이동합니다.")
+                        logging.info(f"✔️ {next_page_num} 페이지로 이동합니다.")
                         await next_page_button.click()
                     else:
                         next_block_button = page.locator(
                             "//ul[contains(@class, 'pagination')]//a[text()='>']"
                         )
                         if await next_block_button.is_visible():
-                            print("✔️ 다음 페이지 블록으로 이동합니다.")
+                            logging.info("✔️ 다음 페이지 블록으로 이동합니다.")
                             await next_block_button.click()
                         else:
-                            print("⭐ 마지막 페이지에 도달하여 크롤링을 종료합니다.")
+                            logging.info(
+                                "⭐ 마지막 페이지에 도달하여 크롤링을 종료합니다."
+                            )
                             break
 
                     await page.wait_for_selector(
@@ -205,21 +226,23 @@ async def main():
                     )
                     page_num += 1
                 except (PlaywrightError, ValueError) as e:
-                    print(f"❌ 페이지 이동 또는 번호 확인 중 오류 발생: {e}")
+                    logging.error(f"❌ 페이지 이동 또는 번호 확인 중 오류 발생: {e}")
                     break
 
     except Exception as e:
-        print(f"\n🚨 예기치 않은 오류가 발생했습니다: {e}")
+        logging.critical(f"🚨 예기치 않은 오류가 발생했습니다: {e}", exc_info=True)
 
     finally:
         if browser:
             await browser.close()
-            print("\n✔️ 브라우저가 종료되었습니다.")
+            logging.info("✔️ 브라우저가 종료되었습니다.")
 
         if not all_car_data:
-            print("❌ 수집된 데이터가 없어 파일 저장을 건너뜁니다.")
+            logging.warning("❌ 수집된 데이터가 없어 파일 저장을 건너뜁니다.")
         else:
-            print("\n💾 현재까지 수집된 데이터를 저장 및 업로드합니다...")
+            logging.info(
+                f"💾 총 {len(all_car_data)}개의 데이터를 저장 및 업로드합니다..."
+            )
             try:
                 yesterday = datetime.now() - timedelta(days=1)
                 yesterday_str_for_compare = yesterday.strftime("%Y-%m-%d")
@@ -235,25 +258,31 @@ async def main():
                     writer.writeheader()
                     writer.writerows(all_car_data)
 
-                print(f"✔️ 로컬 파일 '{local_file_name}'에 성공적으로 저장했습니다.")
+                logging.info(
+                    f"✔️ 로컬 파일 '{local_file_name}'에 성공적으로 저장했습니다."
+                )
 
-                # --- S3 업로드 로직 ---
                 s3_bucket = "whatlunch-s3"
                 s3_key = f"raw/autohub/{yesterday_str_for_compare}/autohub-{yesterday_str_for_filename}-raw.csv"
 
-                print(f" S3 버킷 '{s3_bucket}'에 업로드를 시작합니다...")
+                logging.info(f" S3 버킷 '{s3_bucket}'에 업로드를 시작합니다...")
                 s3_client = boto3.client("s3")
                 s3_client.upload_file(local_file_name, s3_bucket, s3_key)
-                print(f"✔️ S3에 성공적으로 업로드했습니다: s3://{s3_bucket}/{s3_key}")
+                logging.info(
+                    f"✔️ S3에 성공적으로 업로드했습니다: s3://{s3_bucket}/{s3_key}"
+                )
 
             except Exception as e:
-                print(f"❌ 파일 저장 또는 S3 업로드 중 오류 발생: {e}")
+                logging.error(
+                    f"❌ 파일 저장 또는 S3 업로드 중 오류 발생: {e}", exc_info=True
+                )
 
             finally:
-                # --- 로컬 파일 삭제 ---
                 if local_file_name and os.path.exists(local_file_name):
                     os.remove(local_file_name)
-                    print(f"✔️ 로컬 임시 파일 '{local_file_name}'을 삭제했습니다.")
+                    logging.info(
+                        f"✔️ 로컬 임시 파일 '{local_file_name}'을 삭제했습니다."
+                    )
 
 
 if __name__ == "__main__":
