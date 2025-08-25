@@ -18,8 +18,8 @@ BASE_URLS_TO_CRAWL = {
 DETAIL_PAGE_URL_TEMPLATE = (
     "https://auction.autoinside.co.kr/auction/auction_car_view.do?i_sEntryCd={entry_cd}"
 )
-# S3 저장 경로 템플릿
-S3_PATH_TEMPLATE = "s3://whatlunch-s3/auction_schedule/raw/{date_ymd}/autoinside-schedule-{date_ymd_plain}-raw.csv"
+# S3 저장 경로 템플릿 (수정된 부분)
+S3_PATH_TEMPLATE = "s3://whatlunch-s3/auction_schedule/raw/autoinside/{date_ymd}/autoinside-{date_ymd_plain}-raw.csv"
 
 # 동시 처리 요청 수 (EC2 사양에 따라 1~2로 낮춰야 할 수 있습니다)
 CONCURRENT_REQUESTS = 2

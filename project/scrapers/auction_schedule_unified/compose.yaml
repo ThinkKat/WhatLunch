@@ -2,8 +2,8 @@ services:
   autoinside-crawler:
     # 현재 디렉토리의 Dockerfile을 사용하여 이미지를 빌드합니다.
     build: .
-    image: autoinside-crawler:latest
-    container_name: autoinside-daily-crawler
+    image: schedule-crawler:latest
+    container_name: schedule-crawler
     # EC2 IAM 역할을 사용하므로 별도 자격 증명은 필요 없습니다.
     environment:
       - AWS_REGION=ap-northeast-2

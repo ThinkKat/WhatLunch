@@ -6,8 +6,8 @@ BASE_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 COMPOSE_FILE="${BASE_DIR}/compose.yaml"
 
 # 로그 파일 및 잠금 파일 설정
-LOG_DIR="/var/log/autoinside_crawler"
-LOCK_FILE="/var/run/autoinside_crawler.lock"
+LOG_DIR="/var/log/autoinside_schedule_crawler"
+LOCK_FILE="/var/run/autoinside_schedule_crawler.lock"
 DATE=$(TZ=Asia/Seoul date +%F)
 LOG_FILE="${LOG_DIR}/crawl_${DATE}.log"
 
