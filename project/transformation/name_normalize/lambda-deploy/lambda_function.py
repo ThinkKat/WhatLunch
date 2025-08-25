@@ -31,21 +31,37 @@ import boto3
 s3 = boto3.client("s3")
 
 # -------------------- 설정 --------------------
-# 차량 이름 컬럼 후보 (존재하는 첫 번째 사용)
+# [수정] 다양한 CSV 형식 지원을 위해 후보 컬럼명 추가
 NAME_COL_CANDIDATES = [
+    "차량정보",  # autohub 형식
     "name",
     "car_name",
     "model_name",
     "title",
-    "차량명",
+    "차량명",  # automart 형식
     "차명",
-    "모델명",
+    "모델명",  # onbid 형식
     "full_name",
+    "item_info_raw",  # onbid의 상세 정보 컬럼 (Fallback용)
 ]
-# 브랜드/회사명 컬럼 후보 (이미 있는 경우 우선 사용)
-BRAND_COL_CANDIDATES = ["brand", "브랜드", "company", "회사", "회사명", "메이커"]
-# 모델명 컬럼 후보 (이미 있는 경우 우선 사용)
-MODEL_COL_CANDIDATES = ["model", "모델", "모델명", "차종명", "등급", "grade"]
+BRAND_COL_CANDIDATES = [
+    "brand",
+    "브랜드",  # autohub, onbid 형식
+    "제조사",  # automart 형식
+    "company",
+    "회사",
+    "회사명",
+    "메이커",
+]
+MODEL_COL_CANDIDATES = [
+    "model",
+    "모델",
+    "모델명",  # onbid 형식
+    "차종명",
+    "등급",
+    "grade",
+]
+
 
 # 정규화 도우미
 _ws_re = re.compile(r"\s+")
@@ -195,7 +211,7 @@ def normalize_brand_value(val: str, alias: AliasIndex) -> Optional[str]:
 
 
 def parse_brand_model_from_row(
-    row: Dict[str, str],  # PANDAS-FREE CHANGE: pd.Series 대신 Dict
+    row: Dict[str, str],
     alias: AliasIndex,
     name_col: Optional[str],
     brand_col: Optional[str],
@@ -203,42 +219,49 @@ def parse_brand_model_from_row(
 ) -> Tuple[Optional[str], Optional[str]]:
     # 0) 후보 텍스트 만들기 (우선순위: 모델명 컬럼 → 이름 컬럼)
     text_candidates = []
-    if model_col:
-        text_candidates.append(row.get(model_col, ""))
-    if name_col:
-        text_candidates.append(row.get(name_col, ""))
-    base_text = " ".join([t for t in text_candidates if t and t != "nan"]).strip()
+    if model_col and row.get(model_col):
+        text_candidates.append(str(row.get(model_col, "")))
+    if name_col and row.get(name_col):
+        text_candidates.append(str(row.get(name_col, "")))
+    base_text = " ".join(
+        [t for t in text_candidates if t and t.lower() != "nan"]
+    ).strip()
 
     # 1) 브랜드 우선 결정: 기존 컬럼 값이 있으면 정규화
     brand_hint = None
-    if brand_col:
+    if brand_col and row.get(brand_col):
         brand_hint = normalize_brand_value(row.get(brand_col, None), alias)
 
     # 2) 모델 탐색
+    brand, model = None, None
     if base_text:
+        # 브랜드 힌트가 있으면 해당 브랜드 내에서 모델 탐색
         if brand_hint:
             brand, model = alias.match_model(base_text, brand_hint)
+        # 브랜드 힌트가 없으면, 텍스트에서 브랜드부터 찾고 모델 탐색
         else:
-            brand = alias.match_brand(base_text)
-            brand, model = alias.match_model(base_text, brand)
-    else:
-        brand, model = (brand_hint, None)
+            brand_from_text = alias.match_brand(base_text)
+            brand, model = alias.match_model(base_text, brand_from_text)
 
-    # 3) 브랜드 컬럼이 있었고, 정규화된 브랜드가 있고, 모델만 비었으면 모델만 재시도
-    if brand_hint and (not brand) and (base_text):
-        _, model2 = alias.match_model(base_text, brand_hint)
-        if model2:
-            brand, model = brand_hint, model2
+    # 3) 최종 보정: 브랜드는 있는데 모델을 못 찾은 경우, base_text로 다시 시도
+    if brand_hint and not model and base_text:
+        _, model_only = alias.match_model(base_text)
+        if model_only:
+            model = model_only
+
+    # 4) 최종 보정 2: 브랜드 힌트가 있었고, 텍스트에서 찾은 브랜드가 없다면 힌트를 최종 브랜드로 사용
+    if brand_hint and not brand:
+        brand = brand_hint
 
     return brand, model
 
 
 def transform_data(
-    data: List[Dict[str, str]],  # PANDAS-FREE CHANGE: 데이터 구조 변경
-    header: List[str],  # PANDAS-FREE CHANGE: 헤더 추가
+    data: List[Dict[str, str]],
+    header: List[str],
     alias: AliasIndex,
     model_to_class: Dict[str, str],
-) -> Tuple[List[Dict[str, str]], List[str]]:  # PANDAS-FREE CHANGE: 리턴 타입 변경
+) -> Tuple[List[Dict[str, str]], List[str]]:
     name_col = get_first_col(header, NAME_COL_CANDIDATES)
     brand_col = get_first_col(header, BRAND_COL_CANDIDATES)
     model_col = get_first_col(header, MODEL_COL_CANDIDATES)
@@ -246,7 +269,6 @@ def transform_data(
     for row in data:
         b, m = parse_brand_model_from_row(row, alias, name_col, brand_col, model_col)
 
-        # PANDAS-FREE CHANGE: 새로운 컬럼을 row 딕셔너리에 직접 추가
         row["브랜드"] = b
         row["모델명"] = m
         if not m:
@@ -254,7 +276,6 @@ def transform_data(
         else:
             row["차종"] = model_to_class.get(m, "미분류")
 
-    # PANDAS-FREE CHANGE: 출력 파일에 새로운 컬럼이 포함되도록 헤더 업데이트
     new_header = header[:]
     for col in ["브랜드", "모델명", "차종"]:
         if col not in new_header:
@@ -275,7 +296,7 @@ def parse_input_key(key: str) -> Tuple[str, str]:
     parts = name.split("-")
     if len(parts) < 2:
         raise ValueError(f"입력 파일명에서 경매장/날짜를 찾을 수 없습니다: {base}")
-    auction = "-".join(parts[:-1])  # 경매장에 '-'가 포함될 수도 있음
+    auction = "-".join(parts[:-1])
     yyyymmdd = parts[-1]
     if not re.fullmatch(r"\d{8}", yyyymmdd):
         raise ValueError(f"YYYYMMDD 형식이 아닙니다: {yyyymmdd}")
@@ -283,32 +304,24 @@ def parse_input_key(key: str) -> Tuple[str, str]:
 
 
 def make_output_key(input_key: str) -> str:
-    # 1. 파일명(-raw.csv -> -normal_name.csv)과 경로(raw -> normal_name)를 한 번에 변경
-    # 'raw/' 를 'normal_name/' 으로 첫 번째 한 번만 교체합니다.
     output_key = input_key.replace("raw/", "normal_name/", 1)
-
-    # 2. 파일명의 끝부분을 교체합니다.
     if output_key.endswith("-raw.csv"):
         output_key = output_key[:-8] + "-normal_name.csv"
-
     return output_key
 
 
-# PANDAS-FREE CHANGE: pd.read_csv 대체
 def read_csv_from_s3(bucket: str, key: str) -> Tuple[List[Dict[str, str]], List[str]]:
     obj = s3.get_object(Bucket=bucket, Key=key)
-    body = obj["Body"].read().decode("utf-8-sig")  # BOM 처리 포함
+    body = obj["Body"].read().decode("utf-8-sig")
     reader = csv.DictReader(io.StringIO(body))
     data = list(reader)
     header = reader.fieldnames if reader.fieldnames else []
     return data, header
 
 
-# PANDAS-FREE CHANGE: df.to_csv 대체
 def write_csv_to_s3(
     data: List[Dict[str, str]], header: List[str], bucket: str, key: str
 ):
-    # 엑셀/윈도우 호환을 위해 BOM 포함 UTF-8 권장
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=header, quoting=csv.QUOTE_MINIMAL)
     writer.writeheader()
@@ -320,15 +333,13 @@ def write_csv_to_s3(
 
 
 def lambda_handler(event, context):
-    # 1) 이벤트에서 S3 bucket/key 추출 (ObjectCreated)
     try:
         rec = event["Records"][0]
         bucket = rec["s3"]["bucket"]["name"]
         key = rec["s3"]["object"]["key"]
-    except Exception as e:
+    except (KeyError, IndexError) as e:
         raise RuntimeError(f"S3 이벤트 파싱 실패: {e}")
 
-    # 2) 별칭/차종 데이터 로딩
     brand_alias = load_json_local_or_s3("brand_to_fuzzy.json", "ALIAS_BRAND_S3")
     model_alias = load_json_local_or_s3("brand_norm_to_fuzzy.json", "ALIAS_MODEL_S3")
     if not brand_alias or not model_alias:
@@ -337,17 +348,14 @@ def lambda_handler(event, context):
         )
     alias_index = AliasIndex(brand_alias, model_alias)
 
-    model_to_class = load_model_to_class()  # 없으면 {}
+    model_to_class = load_model_to_class()
 
-    # 3) CSV 읽기 → 변환
     data, header = read_csv_from_s3(bucket, key)
     data_out, header_out = transform_data(data, header, alias_index, model_to_class)
 
-    # 4) 출력 버킷/키 결정
     out_bucket = os.environ.get("OUTPUT_BUCKET", bucket)
     out_key = make_output_key(key)
 
-    # 5) 저장
     write_csv_to_s3(data_out, header_out, out_bucket, out_key)
 
     return {
@@ -362,8 +370,6 @@ def lambda_handler(event, context):
 
 # -------------------- Local test helper --------------------
 if __name__ == "__main__":
-    # 로컬 테스트는 pandas를 사용하지 않으므로 더 이상 필요하지 않습니다.
-    # 필요하다면 아래와 같이 내장 csv 모듈을 사용하여 구현할 수 있습니다.
     import argparse
 
     ap = argparse.ArgumentParser()
@@ -386,7 +392,6 @@ if __name__ == "__main__":
     if os.path.exists(args.model_class):
         mtc = load_local(args.model_class)
 
-    # PANDAS-FREE LOCAL TEST
     with open(args.input_csv, "r", encoding="utf-8-sig") as f_in:
         reader = csv.DictReader(f_in)
         local_data = list(reader)
