@@ -58,7 +58,7 @@ def _to_jsonable(v):
 # Sidebar Settings
 # ----------------------
 st.sidebar.header("Server Settings")
-base_url = st.sidebar.text_input("Base URL", value="http://localhost:8000")
+base_url = st.sidebar.text_input("Base URL", value="http://43.201.57.243:8000")
 optimize_url = base_url.rstrip("/") + "/optimize"
 reoptimize_url = base_url.rstrip("/") + "/reoptimize"
 
