@@ -304,9 +304,31 @@ def parse_input_key(key: str) -> Tuple[str, str]:
 
 
 def make_output_key(input_key: str) -> str:
-    output_key = input_key.replace("raw/", "normal_name/", 1)
+    """
+    입력 S3 키 경로 패턴에 따라 출력 키 경로를 생성합니다.
+
+    1. 's3://.../auction_schedule/raw/[...]' -> 's3://.../auction_schedule/normal_name/[...]'
+    2. 's3://.../raw/[...]'                 -> 's3://.../normal_name/[...]'
+
+    두 경우 모두 파일명의 '-raw.csv' 접미사는 '-normal_name.csv'로 변경됩니다.
+    """
+    output_key = ""
+    # 1. 'auction_schedule' 경로 처리
+    if "auction_schedule/raw/" in input_key:
+        output_key = input_key.replace(
+            "auction_schedule/raw/", "auction_schedule/normal_name/", 1
+        )
+
+    # 2. 일반 'raw' 경로 처리 (다른 모든 경우)
+    else:
+        output_key = input_key.replace("raw/", "normal_name/", 1)
+
+    # 파일명 접미사 변경
     if output_key.endswith("-raw.csv"):
-        output_key = output_key[:-8] + "-normal_name.csv"
+        # rsplit은 파일명 끝에 '-raw.csv'가 확실히 있을 때 더 안전하게 바꿀 수 있습니다.
+        return output_key.rsplit("-raw.csv", 1)[0] + "-normal_name.csv"
+
+    # 만약의 경우를 대비해, 접미사가 없다면 원본 경로를 반환
     return output_key
 
 
