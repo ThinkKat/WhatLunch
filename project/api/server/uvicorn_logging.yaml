@@ -1,0 +1,65 @@
+version: 1
+disable_existing_loggers: false
+
+formatters:
+  default:
+    "()": uvicorn.logging.DefaultFormatter
+    fmt: "%(levelprefix)s %(asctime)s | %(name)s | %(message)s"
+    datefmt: "%Y-%m-%d %H:%M:%S"
+  access:
+    "()": uvicorn.logging.AccessFormatter
+    fmt: '%(levelprefix)s %(asctime)s | %(client_addr)s - "%(request_line)s" %(status_code)s'
+    datefmt: "%Y-%m-%d %H:%M:%S"
+
+handlers:
+  console:
+    class: logging.StreamHandler
+    formatter: default
+    stream: ext://sys.stdout
+    level: INFO
+
+  app_file:
+    class: logging.handlers.TimedRotatingFileHandler
+    formatter: default
+    filename: logs/uvicorn_app.log
+    when: midnight
+    backupCount: 14
+    encoding: utf8
+    level: INFO
+
+  access_file:
+    class: logging.handlers.TimedRotatingFileHandler
+    formatter: access
+    filename: logs/uvicorn_access.log
+    when: midnight
+    backupCount: 14
+    encoding: utf8
+    level: INFO
+
+loggers:
+  uvicorn:
+    level: INFO
+
+  uvicorn.error:
+    level: INFO
+    handlers: [console, app_file]
+    propagate: false
+
+  uvicorn.access:
+    level: INFO
+    handlers: [console, access_file]
+    propagate: false
+
+  fastapi:
+    level: INFO
+    handlers: [console, app_file]
+    propagate: false
+
+  app:
+    level: INFO
+    handlers: [console, app_file]
+    propagate: false
+
+root:
+  level: INFO
+  handlers: [console, app_file]
