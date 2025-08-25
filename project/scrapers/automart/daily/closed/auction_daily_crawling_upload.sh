@@ -74,11 +74,11 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY=${PYTHON:-python3}
 
-CRAWL_PY="${SCRIPT_DIR}/auction_daily_complete_crawling.py"
-[[ -f "${CRAWL_PY}" ]] || CRAWL_PY="auction_daily_complete_crawling.py"
+CRAWL_PY="${SCRIPT_DIR}/auction_daily_closed_crawling.py"
+[[ -f "${CRAWL_PY}" ]] || CRAWL_PY="auction_daily_closed_crawling.py"
 
-JSON2CSV_S3_PY="${SCRIPT_DIR}/auction_daily_complete_upload.py"
-[[ -f "${JSON2CSV_S3_PY}" ]] || JSON2CSV_S3_PY="auction_daily_complete_upload.py"
+JSON2CSV_S3_PY="${SCRIPT_DIR}/auction_daily_closed_upload.py"
+[[ -f "${JSON2CSV_S3_PY}" ]] || JSON2CSV_S3_PY="auction_daily_closed_upload.py"
 
 # --- 사전 체크 ---
 command -v "${PY}" >/dev/null 2>&1 || { echo "[ERR] python 실행 파일을 찾지 못했습니다(PYTHON=${PY})."; exit 2; }
