@@ -7,6 +7,7 @@ CRON_LOG_DIR="${LOG_ROOT}/crawler"
 AUTOINSIDE_LOG_DIR="${LOG_ROOT}/autoinside"
 AUTOHUB_LOG_DIR="${LOG_ROOT}/autohub"
 ONBID_LOG_DIR="${LOG_ROOT}/onbid"
+AUTOMART_LOG_DIR="${LOG_ROOT}/automart" # automart 로그 디렉토리
 LOCK_FILE="/var/run/crawler.lock"
 
 DATE="$(TZ=Asia/Seoul date +%F)"
@@ -14,7 +15,7 @@ MAX_RETRY=2
 BACKOFF_SEC=30
 
 export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-mkdir -p "$CRON_LOG_DIR" "$AUTOINSIDE_LOG_DIR" "$AUTOHUB_LOG_DIR" "$ONBID_LOG_DIR"
+mkdir -p "$CRON_LOG_DIR" "$AUTOINSIDE_LOG_DIR" "$AUTOHUB_LOG_DIR" "$ONBID_LOG_DIR" "$AUTOMART_LOG_DIR"
 
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
@@ -40,5 +41,6 @@ run_job() {
 run_job "autoinside" "$AUTOINSIDE_LOG_DIR" "$DATE"
 run_job "autohub"    "$AUTOHUB_LOG_DIR"    "$DATE"
 run_job "onbid_daily" "$ONBID_LOG_DIR"    "$DATE"
+run_job "automart"   "$AUTOMART_LOG_DIR"   "$DATE" # automart 작업 실행 추가
 
 echo "[INFO] All jobs done for ${DATE}." | tee -a "${CRON_LOG_DIR}/cron_${DATE}.log"

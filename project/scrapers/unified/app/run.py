@@ -1,42 +1,30 @@
-#!/usr/bin/env python3
-import os, sys, subprocess
-
-# setproctitle은 선택 의존성입니다. 없으면 no-op으로 대체합니다.
-try:
-    from setproctitle import setproctitle
-except Exception:
-
-    def setproctitle(_):
-        pass
-
-
-CRAWLER_ID = os.getenv("CRAWLER_ID", "").strip()
-CRAWLER_NAME = os.getenv("CRAWLER_NAME", CRAWLER_ID).strip() or "crawler"
-DATE = os.getenv("DATE")
-
-ENTRYPOINTS = {
-    "autoinside": ["python", "-u", "sites/autoinside_daily_ec2.py"],
-    "autohub": ["python", "-u", "sites/autohub_daily_ec2.py"],
-    "onbid_daily": ["/bin/bash", "-lc", "/app/daily_crawler.sh"],
-}
+import os
+import subprocess
+import sys
 
 
 def main():
-    if CRAWLER_ID not in ENTRYPOINTS:
-        print(f"[ERR] Unknown CRAWLER_ID={CRAWLER_ID}", file=sys.stderr)
-        sys.exit(2)
+    crawler_name = os.environ.get("CRAWLER_NAME")
+    if not crawler_name:
+        print("[ERROR] CRAWLER_NAME environment variable not set.", file=sys.stderr)
+        sys.exit(1)
 
-    # ps/top에서 식별 가능하도록 프로세스명 지정
-    setproctitle(f"crawler:{CRAWLER_NAME}")
+    print(f"[INFO] Running crawler: {crawler_name}")
 
-    env = os.environ.copy()
-    if DATE:
-        env["DATE"] = DATE
+    if crawler_name == "autoinside":
+        subprocess.run(["python", "/app/sites/autoinside_daily_ec2.py"], check=True)
+    elif crawler_name == "autohub":
+        subprocess.run(["python", "/app/sites/autohub_daily_ec2.py"], check=True)
+    elif crawler_name == "onbid_daily":
+        subprocess.run(["/app/daily_crawler.sh"], check=True)
+    elif crawler_name == "automart":
+        # 새로 추가된 automart 크롤러 실행
+        subprocess.run(["python", "/app/sites/automart_daily_ec2.py"], check=True)
+    else:
+        print(f"[ERROR] Unknown crawler name: {crawler_name}", file=sys.stderr)
+        sys.exit(1)
 
-    cmd = ENTRYPOINTS[CRAWLER_ID]
-    print(f"[INFO] Launch: {CRAWLER_NAME} -> {' '.join(cmd)}")
-    proc = subprocess.run(cmd, env=env)
-    sys.exit(proc.returncode)
+    print(f"[INFO] Crawler finished: {crawler_name}")
 
 
 if __name__ == "__main__":

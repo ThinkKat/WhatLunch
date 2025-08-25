@@ -6,7 +6,7 @@ services:
       CRAWLER_ID: "autoinside"
       CRAWLER_NAME: "autoinside"
       AWS_REGION: "ap-northeast-2"
-      BUCKET: "whatlunch-s3"   # autoinside 스크립트가 사용
+      BUCKET: "whatlunch-s3"
       TZ: "Asia/Seoul"
     labels:
       com.whatlunch.crawler: "autoinside"
@@ -46,4 +46,21 @@ services:
       - /var/log/onbid:/logs
       - /data/onbid/base:/app/base
       - /data/onbid/result:/app/result
+    restart: "no"
+
+  automart:
+    image: crawler:latest
+    container_name: crawler-automart
+    environment:
+      CRAWLER_ID: "automart"
+      CRAWLER_NAME: "automart"
+      AWS_REGION: "ap-northeast-2"
+      BUCKET: "whatlunch-s3"
+      TZ: "Asia/Seoul"
+    labels:
+      com.whatlunch.crawler: "automart"
+    shm_size: "1g"
+    volumes:
+      - /var/log/automart:/logs
+      - /data/automart:/data # 데이터 볼륨은 선택 사항
     restart: "no"
