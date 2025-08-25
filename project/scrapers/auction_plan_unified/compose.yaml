@@ -1,0 +1,14 @@
+services:
+  autoinside-crawler:
+    # 현재 디렉토리의 Dockerfile을 사용하여 이미지를 빌드합니다.
+    build: .
+    image: autoinside-crawler:latest
+    container_name: autoinside-daily-crawler
+    # EC2 IAM 역할을 사용하므로 별도 자격 증명은 필요 없습니다.
+    environment:
+      - AWS_REGION=ap-northeast-2
+      - TZ=Asia/Seoul
+    # 경량 인스턴스에서 안정적인 실행을 위한 공유 메모리 설정
+    shm_size: "1g"
+    # 일회성 작업이므로 재시작하지 않습니다.
+    restart: "no"
