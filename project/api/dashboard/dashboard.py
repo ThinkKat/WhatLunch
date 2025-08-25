@@ -1,198 +1,293 @@
-# streamlit_api1_client.py
-# -----------------------------------------------------------
-# KCar – API1 HTTP Client (optimize)
-# - /optimize 엔드포인트에 JSON을 POST하고 응답을 시각화
-# - 파일 업로드/직접 붙여넣기/샘플 입력, Mock 모드 지원
-# -----------------------------------------------------------
-
 import json
-import time
-from typing import Any, Dict, Optional
-
-import pandas as pd
 import requests
+import pandas as pd
 import streamlit as st
+from datetime import date, datetime, timedelta
 
-st.set_page_config(page_title="KCar – API1 Client (optimize)", layout="wide")
-st.title("KCar – API1 HTTP Client (optimize)")
+st.set_page_config(page_title="Auction Optimizer UI", layout="wide")
 
-# ---------------- Sidebar -----------------
-with st.sidebar:
-    st.header("연결 설정")
-    endpoint = st.text_input("API Endpoint", value="http://43.201.57.243:8000/optimize")
-    # timeout = st.number_input("Timeout (sec)", min_value=1, max_value=120, value=20, step=1)
-    mock_mode = st.toggle("Mock Mode (HTTP 호출 없이 샘플 출력)", value=False)
-    # 필요하면 인증 토큰 추가:
-    use_auth = st.checkbox("Authorization 헤더 사용")
-    token = st.text_input("Bearer Token", value="", type="password", disabled=not use_auth)
-
-    if st.button("엔드포인트 점검"):
-        try:
-            t0 = time.time()
-            r = requests.options(endpoint, timeout=5)
-            st.success(f"OK · {r.status_code} · {time.time()-t0:.2f}s")
-        except Exception as e:
-            st.error(f"접속 실패: {e}")
-
-# --------------- INPUT --------------------
-st.subheader("1) 입력 JSON")
-
-DEFAULT_INPUT = {
-    "month": "2025-08-25",
-    "budget": 100000000,
-    "purchase_plans": [
-        {"brand": "현대", "model": "아반떼", "year": 2023, "target_units": 10},
-        {"brand": "기아", "model": "K5", "year": 2022, "target_units": 10}
-    ]
-}
-
-col_in1, col_in2 = st.columns([2,1])
-with col_in1:
-    uploaded = st.file_uploader("파일 업로드(.json)", type=["json"], key="api1_input_upload")
-    if uploaded is not None:
-        try:
-            st.session_state["input_text"] = uploaded.read().decode("utf-8")
-        except Exception as e:
-            st.error(f"파일 읽기 오류: {e}")
-
-with col_in2:
-    if st.button("샘플 입력 불러오기", type="secondary"):
-        st.session_state["input_text"] = json.dumps(DEFAULT_INPUT, ensure_ascii=False, indent=2)
-
-input_text = st.text_area(
-    "또는 아래에 직접 붙여넣기",
-    value=st.session_state.get("input_text", json.dumps(DEFAULT_INPUT, ensure_ascii=False, indent=2)),
-    height=240,
-)
-
-# --------------- ACTION --------------------
-c_go, c_clear = st.columns([1,1])
-with c_go:
-    run = st.button("요청 보내기 (POST /optimize)", type="primary")
-with c_clear:
-    clear = st.button("초기화")
-
-if clear:
-    for k in ["input_text", "last_request_json", "last_response_json", "last_error"]:
-        st.session_state.pop(k, None)
-    st.experimental_rerun()
-
-# --------------- Helpers -------------------
-def try_parse_json(txt: str) -> Optional[Dict[str, Any]]:
+# ----------------------
+# Helpers
+# ----------------------
+def post_json(url: str, payload: dict):
     try:
-        return json.loads(txt)
+        resp = requests.post(url, json=payload, timeout=60)
+        try:
+            return resp.status_code, resp.json()
+        except Exception:
+            return resp.status_code, {"raw": resp.text}
     except Exception as e:
-        st.error(f"입력 JSON 파싱 오류: {e}")
+        return 500, {"error": str(e)}
+
+def _fmt_int(x):
+    try:
+        return f"{int(x):,}"
+    except Exception:
+        return x
+
+def _safe_date(s):
+    try:
+        return datetime.strptime(s, "%Y-%m-%d").date()
+    except Exception:
+        try:
+            return pd.to_datetime(s).date()
+        except Exception:
+            return None
+
+def _to_jsonable(v):
+    if isinstance(v, (pd.Timestamp, datetime)):
+        return v.strftime("%Y-%m-%d")
+    if v is None:
         return None
+    try:
+        if pd.isna(v):
+            return None
+    except Exception:
+        pass
+    if isinstance(v, (int, float, str, bool)):
+        return v
+    try:
+        return int(v)
+    except Exception:
+        try:
+            return float(v)
+        except Exception:
+            return str(v)
 
-def normalize_output(obj: Dict[str, Any]) -> pd.DataFrame:
-    auctions = obj.get("auction_list", []) or []
-    df = pd.DataFrame(auctions)
-    pref = [
-        "auction_house","listing_id","record_id","max_bid_price",
-        "expected_price","auction_end_date","경매종료일","action_type","win_probability"
-    ]
-    if not df.empty:
-        cols = [c for c in pref if c in df.columns] + [c for c in df.columns if c not in pref]
-        df = df[cols]
-    return df
+# ----------------------
+# Sidebar Settings
+# ----------------------
+st.sidebar.header("Server Settings")
+base_url = st.sidebar.text_input("Base URL", value="http://localhost:8000")
+optimize_url = base_url.rstrip("/") + "/optimize"
+reoptimize_url = base_url.rstrip("/") + "/reoptimize"
 
-def kpis_from_output(obj: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "expected_units": obj.get("expected_purchase_units") or obj.get("expected_no_units_purchased"),
-        "expected_cost": obj.get("total_expected_cost"),
-        "auction_count": len(obj.get("auction_list", []) or [])
+st.sidebar.markdown("---")
+st.sidebar.caption("TIP: uvicorn fastapi_app:app --host 0.0.0.0 --port 8000")
+
+# ----------------------
+# Session storage & UI state
+# ----------------------
+if "api1_output" not in st.session_state:
+    st.session_state["api1_output"] = None
+if "api1_input" not in st.session_state:
+    st.session_state["api1_input"] = None
+
+# Expander states
+if "exp_api1_input" not in st.session_state:
+    st.session_state["exp_api1_input"] = True
+if "exp_api1_output" not in st.session_state:
+    st.session_state["exp_api1_output"] = False
+if "exp_api2_prep" not in st.session_state:
+    st.session_state["exp_api2_prep"] = False
+if "exp_api2_request" not in st.session_state:
+    st.session_state["exp_api2_request"] = False
+if "exp_api2_output" not in st.session_state:
+    st.session_state["exp_api2_output"] = False
+
+st.title("Auction Optimizer (API1 → API2)")
+
+# ======================================================
+# STEP 1: API1 (/optimize)
+# ======================================================
+st.header("Step 1 — API1: Optimize")
+st.caption("입찰상한가 계산 후 예산 내 최대 매입대수를 선정합니다. (출력 포맷: example_output.json)")
+
+with st.expander("API1 입력 설정", expanded=st.session_state.get("exp_api1_input", True)):
+    colL, colR = st.columns([2,1])
+    with colL:
+        default_api1 = {
+            "month": str(date.today()),
+            "budget": 1_000_000_000,
+            "purchase_plans": [
+                {"brand":"현대","model":"소나타","year":2016,"target_units":2},
+                {"brand":"기아","model":"K5","year":2014,"target_units":1},
+            ]
+        }
+        api1_text = st.text_area(
+            "API1 Request Body (JSON)", 
+            value=json.dumps(default_api1, ensure_ascii=False, indent=2),
+            height=280
+        )
+        uploaded1 = st.file_uploader("또는 JSON 파일 업로드", type=["json"], key="api1_upload")
+        if uploaded1 is not None:
+            try:
+                api1_text = uploaded1.read().decode("utf-8")
+            except:
+                st.error("파일을 읽을 수 없습니다.")
+    with colR:
+        st.info(f"POST {optimize_url}")
+        run_api1 = st.button("API1 실행", type="primary")
+
+    if run_api1:
+        try:
+            api1_payload = json.loads(api1_text)
+        except Exception as e:
+            st.error(f"JSON 파싱 실패: {e}")
+            st.stop()
+
+        st.session_state["api1_input"] = api1_payload
+        code1, out1 = post_json(optimize_url, api1_payload)
+        if code1 != 200:
+            st.error(f"API1 실패 (HTTP {code1})")
+            st.json(out1)
+            st.stop()
+        st.success("API1 성공")
+        st.session_state["api1_output"] = out1
+
+        st.session_state["exp_api1_input"] = False
+        st.session_state["exp_api1_output"] = True
+        st.session_state["exp_api2_prep"] = True
+        st.session_state["exp_api2_request"] = True
+
+api1_out = st.session_state.get("api1_output")
+if api1_out:
+    with st.expander("API1 결과", expanded=st.session_state.get("exp_api1_output", False)):
+        st.subheader("API1 결과 미리보기")
+        col1, col2, col3 = st.columns(3)
+        with col1: st.metric("예상 매입대수", api1_out.get("expected_purchase_units"))
+        with col2: st.metric("총 소진 금액", _fmt_int(api1_out.get("total_expected_cost", 0)))
+        with col3: st.metric("목록 개수", len(api1_out.get("auction_list", [])) if isinstance(api1_out.get("auction_list"), list) else 0)
+        st.dataframe(pd.json_normalize(api1_out.get("auction_list", [])), use_container_width=True)
+
+# ======================================================
+# STEP 2: API2 (/reoptimize)
+# ======================================================
+st.header("Step 2 — API2: Reoptimize")
+st.caption("해당 월(as_of 기준)의 1일 ~ as_of-1일까지 종료된 경매 결과를 학습하여 상한가를 재조정하고, 동일 포맷으로 결과를 반환합니다.")
+
+# prefill_block = st.container()
+
+if api1_out and isinstance(api1_out.get("auction_list", []), list) and len(api1_out["auction_list"]) > 0:
+    with st.expander("API2 결과 편집(기간/상태)", expanded=st.session_state.get("exp_api2_prep", False)):
+        as_of = st.date_input("as_of (YYYY-MM-DD)", value=date.today(), help="기본: 오늘. as_of 월의 1일 ~ as_of-1일까지를 대상 기간으로 봅니다.")
+        yday = as_of - timedelta(days=1)
+        month_start = as_of.replace(day=1)
+        st.caption(f"대상 기간: {month_start.isoformat()} ~ {yday.isoformat()}")
+
+        al = pd.DataFrame(api1_out["auction_list"]).copy()
+        al["auction_end_date"] = al["auction_end_date"].apply(_safe_date)
+        period_rows = al[(al["auction_end_date"] >= month_start) & (al["auction_end_date"] <= yday)].copy()
+
+        st.write(f"API1 결과 중 대상 기간 종료분: {period_rows.shape[0]}건")
+        if period_rows.empty:
+            st.info("대상 기간 종료분이 없습니다. 직접 결과를 업로드하거나 JSON을 입력해 주세요.")
+
+        if not period_rows.empty:
+            prefilled = pd.DataFrame({
+                "auction_end_date": period_rows.get("auction_end_date"),
+                "auction_house": period_rows.get("auction_house", ""),
+                "listing_id": period_rows.get("listing_id", ""),
+                "brand": period_rows.get("brand", ""),
+                "model": period_rows.get("model", ""),
+                "year": period_rows.get("year", None),
+                "displacement_cc": period_rows.get("displacement_cc", None),
+                "mileage_km": period_rows.get("mileage_km", None),
+                "cap_level": period_rows.get("cap_level", ""),
+                "cap_n": period_rows.get("cap_n", None),
+                "max_bid_price": period_rows.get("max_bid_price", 0).astype(int),
+                "result": ["NO_BID"] * len(period_rows)
+            })
+            st.markdown("**결과 편집 (SUCCESS / FAIL / NO_BID 지정)**")
+            edited = st.data_editor(
+                prefilled,
+                use_container_width=True,
+                num_rows="dynamic",
+                key="api2_editor",
+                column_config={
+                    "result": st.column_config.SelectboxColumn(
+                        "result",
+                        help="SUCCESS / FAIL / NO_BID",
+                        options=["SUCCESS","FAIL","NO_BID"],
+                        required=True,
+                        default="NO_BID"
+                    ),
+                    "auction_end_date": st.column_config.DateColumn("auction_end_date", help="경매 종료일", format="YYYY-MM-DD"),
+                    "max_bid_price": st.column_config.NumberColumn("max_bid_price", help="해당 시점 상한가", step=1, min_value=0),
+                    "cap_n": st.column_config.NumberColumn("cap_n")
+                }
+            )
+        else:
+            edited = pd.DataFrame(columns=["auction_house","listing_id","max_bid_price","result"])
+else:
+    st.info("먼저 위에서 API1을 실행하세요.")
+    edited = pd.DataFrame(columns=["auction_house","listing_id","max_bid_price","result"])
+    as_of = date.today()
+
+st.markdown("---")
+
+with st.expander("API2 요청 구성", expanded=st.session_state.get("exp_api2_request", False)):
+    api1_in = st.session_state.get("api1_input") or {}
+    base_budget = int(api1_in.get("budget", 0))
+
+    c1, c2, c3 = st.columns([1.1, 1.1, 1])
+    with c1:
+        st.metric("기준 예산(budget, API1)", f"{base_budget:,}")
+    with c2:
+        auto_deduct = st.checkbox("SUCCESS 금액만큼 예산 차감", value=True,
+                                  help="result=SUCCESS 행들의 max_bid_price 합계를 예산에서 미리 차감합니다. (FAIL/NO_BID는 차감 안 함)")
+    if isinstance(edited, pd.DataFrame) and not edited.empty and auto_deduct:
+        try:
+            success_mask = edited["result"].astype(str).str.upper() == "SUCCESS"
+            deduct = int(pd.to_numeric(edited.loc[success_mask, "max_bid_price"], errors="coerce").fillna(0).astype(int).sum())
+        except Exception:
+            deduct = 0
+    else:
+        deduct = 0
+    with c3:
+        st.metric("차감 합계", f"{deduct:,}")
+
+    new_budget = max(0, base_budget - deduct) if auto_deduct else base_budget
+    st.metric("API2 요청 예산(적용)", f"{new_budget:,}")
+
+    auction_results_jsonable = []
+    if isinstance(edited, pd.DataFrame) and not edited.empty:
+        for row in edited.to_dict(orient="records"):
+            auction_results_jsonable.append({k: _to_jsonable(v) for k, v in row.items()})
+
+    api2_payload_default = {
+        "budget": new_budget,
+        "auction_results": auction_results_jsonable
     }
 
-# --------------- Request -------------------
-if run:
-    req_json = try_parse_json(input_text)
-    if req_json:
-        st.session_state["last_request_json"] = req_json
-        if mock_mode:
-            sample_out = {
-              "expected_purchase_units": 3,
-              "total_expected_cost": 67472110,
-              "auction_list": [
-                {"auction_house":"엔카오토","listing_id":"encar002","max_bid_price":16000000,"expected_price":14558400,"auction_end_date":"2025-09-02","action_type":"moderate","win_probability":0.5530},
-                {"auction_house":"케이카","listing_id":"kcar003","max_bid_price":19570000,"expected_price":17730071,"auction_end_date":"2025-09-03","action_type":"moderate","win_probability":0.4823},
-                {"auction_house":"오토허브","listing_id":"hub004","max_bid_price":15400000,"expected_price":15332468,"auction_end_date":"2025-09-04","action_type":"moderate","win_probability":0.4695},
-                {"auction_house":"오토허브","listing_id":"hub006","max_bid_price":19150000,"expected_price":17486782,"auction_end_date":"2025-09-06","action_type":"very_aggressive","win_probability":0.8551}
-              ]
-            }
-            st.session_state["last_response_json"] = sample_out
-            st.session_state["last_error"] = None
-        else:
-            try:
-                headers = {"Content-Type":"application/json"}
-                if use_auth and token:
-                    headers["Authorization"] = f"Bearer {token}"
-                with st.spinner("요청 중..."):
-                    t0 = time.time()
-                    resp = requests.post(endpoint, json=req_json, headers=headers)
-                    elapsed = time.time() - t0
-                if resp.status_code >= 400:
-                    st.session_state["last_error"] = f"HTTP {resp.status_code}: {resp.text[:500]}"
-                    st.session_state["last_response_json"] = None
-                else:
-                    try:
-                        st.session_state["last_response_json"] = resp.json()
-                        st.session_state["last_error"] = None
-                        st.toast(f"완료: {elapsed:.2f}s", icon="✅")
-                    except Exception:
-                        st.session_state["last_error"] = f"JSON 파싱 실패: {resp.text[:500]}"
-                        st.session_state["last_response_json"] = None
-            except requests.exceptions.RequestException as e:
-                st.session_state["last_error"] = f"요청 실패: {e}"
-                st.session_state["last_response_json"] = None
+    api2_text = st.text_area(
+        "API2 Request Body (JSON)",
+        value=json.dumps(api2_payload_default, ensure_ascii=False, indent=2),
+        height=260
+    )
+    uploaded2 = st.file_uploader("또는 API2 JSON 업로드", type=["json"], key="api2_upload")
+    if uploaded2 is not None:
+        try:
+            api2_text = uploaded2.read().decode("utf-8")
+        except:
+            st.error("파일을 읽을 수 없습니다.")
 
-# --------------- Preview -------------------
-st.markdown("---")
-st.subheader("2) 요청/응답 미리보기")
+    st.info(f"POST {reoptimize_url}?as_of={as_of.isoformat()}")
+    run_api2 = st.button("API2 실행", type="primary")
 
-c_req, c_res = st.columns(2)
-with c_req:
-    st.markdown("**Request JSON**")
-    st.json(st.session_state.get("last_request_json") or try_parse_json(input_text) or DEFAULT_INPUT)
+    if run_api2:
+        try:
+            api2_payload = json.loads(api2_text)
+        except Exception as e:
+            st.error(f"JSON 파싱 실패: {e}")
+            st.stop()
 
-with c_res:
-    st.markdown("**Response JSON**")
-    if st.session_state.get("last_error"):
-        st.error(st.session_state["last_error"])
-    st.json(st.session_state.get("last_response_json") or {"hint": "아직 응답이 없습니다. (Mock Mode로도 확인 가능)"})
+        code2, out2 = post_json(f"{reoptimize_url}?as_of={as_of.isoformat()}", api2_payload)
+        if code2 != 200:
+            st.error(f"API2 실패 (HTTP {code2})")
+            st.json(out2)
+            st.stop()
+        st.success("API2 성공")
+        st.session_state["exp_api2_request"] = False
+        st.session_state["exp_api2_output"] = True
+        st.session_state["api2_output_data"] = out2
 
-# --------------- KPIs & Table --------------
-out_obj = st.session_state.get("last_response_json")
-if out_obj:
-    k = kpis_from_output(out_obj)
-    c1, c2, c3 = st.columns(3)
-    c1.metric("예상 매입대수", f"{(k['expected_units'] or 0):,} 대")
-    total_cost = k.get("expected_cost")
-    c2.metric("총 예상 비용", f"{(int(total_cost) if total_cost else 0):,} 원")
-    c3.metric("경매 매물 수", f"{k['auction_count']:,} 건")
-
-    df = normalize_output(out_obj)
-    st.markdown("### 경매 매물 리스트")
-    if not df.empty:
-        if "max_bid_price" in df.columns:
-            df["max_bid_price"] = df["max_bid_price"].map(lambda x: int(x) if pd.notna(x) else x)
-        if "expected_price" in df.columns:
-            df["expected_price"] = df["expected_price"].map(lambda x: int(x) if pd.notna(x) else x)
-
-        df_fmt = df.rename(columns={
-            "auction_house": "경매장",
-            "listing_id": "리스팅ID",
-            "record_id": "레코드ID",
-            "max_bid_price": "입찰상한가(원)",
-            "expected_price": "예상낙찰가(원)",
-            "auction_end_date": "경매종료일",
-            "경매종료일": "경매종료일",
-            "action_type": "액션",
-            "win_probability": "낙찰확률"
-        })
-        st.dataframe(df_fmt, use_container_width=True, hide_index=True)
-
-        csv_bytes = df_fmt.to_csv(index=False).encode("utf-8-sig")
-        st.download_button("CSV 다운로드", csv_bytes, file_name="api1_auction_list.csv", mime="text/csv")
-    else:
-        st.info("응답에 auction_list가 비어 있습니다.")
+api2_out = st.session_state.get("api2_output_data")
+if api2_out:
+    with st.expander("API2 결과", expanded=st.session_state.get("exp_api2_output", False)):
+        st.subheader("API2 결과")
+        c1, c2, c3 = st.columns(3)
+        with c1: st.metric("예상 매입대수", api2_out.get("expected_purchase_units"))
+        with c2: st.metric("총 소진 금액", _fmt_int(api2_out.get("total_expected_cost", 0)))
+        with c3: st.metric("목록 개수", len(api2_out.get("auction_list", [])) if isinstance(api2_out.get("auction_list"), list) else 0)
+        st.dataframe(pd.json_normalize(api2_out.get("auction_list", [])), use_container_width=True)
