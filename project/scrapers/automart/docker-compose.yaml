@@ -8,3 +8,13 @@ services:
     hostname: automart-auction-closed
     tty: true
     entrypoint: ["/app/automart/daily/closed/auction_daily_closed_crawling_upload.sh"]
+
+  automart-auction-open:
+    build:
+      context: .
+      dockerfile: daily/docker/Dockerfile
+    image: automart-auction-open:latest
+    container_name: automart-auction-open
+    hostname: automart-auction-open
+    tty: true
+    entrypoint: ["/app/automart/daily/closed/auction_daily_open_crawling_upload.sh"]
