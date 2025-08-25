@@ -61,7 +61,6 @@ def lambda_handler(event, context):
         header = [h.strip() for h in next(csv_reader)]
         col_indices = {name: i for i, name in enumerate(header)}
 
-        auction_house = path.split("_", maxsplit=1)[0]
         processed_rows = []
         for row in csv_reader:
             new_row = [
