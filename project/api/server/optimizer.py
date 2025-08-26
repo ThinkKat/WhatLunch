@@ -9,6 +9,7 @@ import json
 from collections import defaultdict
 from copy import deepcopy
 from tqdm import tqdm
+import textwrap
 
 @dataclass
 class AuctionItem:
@@ -228,7 +229,6 @@ class MCTSAuctionOptimizer:
         
     def _preprocess_data(self):
         """기존 CarAuctionOptimizer와 동일한 전처리"""
-        print(f"[전처리 시작] {len(self.historical_data)}개 차량 데이터")
         columns_for_key = [col for col in self.historical_data.columns if col not in ['winning_price', 'auction_date']]
 
         self.historical_data["auction_date"] = pd.to_datetime(self.historical_data["auction_date"], format='mixed')
@@ -269,41 +269,83 @@ class MCTSAuctionOptimizer:
         return weights
     
     def _find_similar_cars(self, auction_item: AuctionItem) -> List[int]:
-        """유사한 차량 인덱스 찾기"""
-        filtered_df = self.processed_data[
+        """유사한 차량 인덱스 찾기 - 계층적 유사도 검색"""
+        
+        # 1차: 정확한 브랜드+모델 매칭
+        exact_match_df = self.processed_data[
             (self.processed_data['brand'] == auction_item.brand) & 
             (self.processed_data['model'] == auction_item.model)
         ]
         
-        if len(filtered_df) == 0:
-            return []
-            
-        similar_indices = []
-        for idx, row in filtered_df.iterrows():
-            year_diff = abs(auction_item.year - row['year'])
-            mileage_diff = abs(auction_item.mileage_km - row['mileage_km'])
-            
-            if year_diff <= 2 and mileage_diff <= 30000:
-                original_idx = self.processed_data.index.get_loc(idx)
-                similar_indices.append(original_idx)
+        if len(exact_match_df) > 0:
+            similar_indices = []
+            for idx, row in exact_match_df.iterrows():
+                year_diff = abs(auction_item.year - row['year'])
+                mileage_diff = abs(auction_item.mileage_km - row['mileage_km'])
                 
-        return similar_indices
+                if year_diff <= 2 and mileage_diff <= 30000:
+                    original_idx = self.processed_data.index.get_loc(idx)
+                    similar_indices.append(original_idx)
+            
+            if similar_indices:
+                return similar_indices
+        
+        # 2차: 같은 브랜드 내 다른 모델 (유사한 연식/주행거리)
+        brand_match_df = self.processed_data[
+            self.processed_data['brand'] == auction_item.brand
+        ]
+        
+        if len(brand_match_df) > 0:
+            similar_indices = []
+            for idx, row in brand_match_df.iterrows():
+                year_diff = abs(auction_item.year - row['year'])
+                mileage_diff = abs(auction_item.mileage_km - row['mileage_km'])
+                
+                # 다른 모델이므로 더 엄격한 조건
+                if year_diff <= 1 and mileage_diff <= 20000:
+                    original_idx = self.processed_data.index.get_loc(idx)
+                    similar_indices.append(original_idx)
+            
+            if similar_indices:
+                print(f"⚠️  {auction_item.brand} {auction_item.model}의 정확한 매칭이 없어 동일 브랜드 {len(similar_indices)}개 차량을 참조합니다.")
+                return similar_indices
+        
+        # 3차: 전체 데이터에서 유사한 연식의 차량 (최후의 수단)
+        fallback_df = self.processed_data[
+            abs(self.processed_data['year'] - auction_item.year) <= 1
+        ]
+        
+        if len(fallback_df) > 0:
+            # 무작위로 최대 10개 샘플 선택
+            sample_size = min(10, len(fallback_df))
+            sampled_indices = fallback_df.sample(n=sample_size).index.tolist()
+            print(f"⚠️  {auction_item.brand} {auction_item.model}의 유사 데이터가 없어 동일 연식 {sample_size}개 차량을 참조합니다.")
+            return [self.processed_data.index.get_loc(idx) for idx in sampled_indices]
+        
+        print(f"⚠️  {auction_item.brand} {auction_item.model}의 참조 데이터가 전혀 없습니다. 기본 전략을 사용합니다.")
+        return []
     
     def _calculate_win_probability(self, auction_item: AuctionItem, bid_price: float) -> float:
         """입찰 성공 확률 계산"""
         similar_indices = self._find_similar_cars(auction_item)
         
         if not similar_indices:
-            # 유사 차량이 없는 경우 - 입찰가가 높을수록 확률 증가
+            # 참조 데이터가 전혀 없는 경우: 보수적이지만 합리적인 확률 모델
             price_ratio = bid_price / auction_item.min_price
-            if price_ratio >= 1.5:
-                return 0.8
-            elif price_ratio >= 1.3:
-                return 0.6
-            elif price_ratio >= 1.1:
-                return 0.4
-            else:
-                return 0.2
+            
+            # 시장 일반론 기반 확률 (경험적 모델)
+            if price_ratio >= 1.6:      # 최소가의 160% 이상
+                return 0.85
+            elif price_ratio >= 1.4:    # 140% 이상  
+                return 0.70
+            elif price_ratio >= 1.25:   # 125% 이상
+                return 0.55
+            elif price_ratio >= 1.15:   # 115% 이상
+                return 0.40
+            elif price_ratio >= 1.05:   # 105% 이상
+                return 0.25
+            else:                       # 최소가 근처
+                return 0.15
         
         # 유사 차량들의 가격 데이터로 확률 계산
         all_prices = []
@@ -327,14 +369,18 @@ class MCTSAuctionOptimizer:
                 if price <= bid_price:
                     weighted_success += weight
             
-            return min(weighted_success / total_weight if total_weight > 0 else 0.3, 0.95)
+            calculated_prob = weighted_success / total_weight if total_weight > 0 else 0.3
+            return min(calculated_prob, 0.95)  # 최대 95% 제한
         
+        # fallback
         return 0.3
     
     def _apply_action(self, state: AuctionState, action: AuctionAction) -> Tuple[AuctionState, float]:
-        """액션을 적용해서 새로운 상태 생성 - 목표 달성 중심의 보상"""
+        """
+        액션을 적용해서 새로운 상태 생성 - 개별 액션에는 보상 없음 (에피소드 종료시에만 보상)
+        """
         new_state = deepcopy(state)
-        reward = 0
+        reward = 0  # 개별 액션에는 보상 없음! 오직 에피소드 종료시에만
         
         if not new_state.available_auctions:
             return new_state, reward
@@ -347,23 +393,8 @@ class MCTSAuctionOptimizer:
         new_state.time_step += 1
         
         if action.bid_amount == 0:  # Skip
-            # 목표 달성이 필요한 차량을 건너뛰는 경우 큰 페널티
-            if (model_key in new_state.remaining_targets and 
-                new_state.remaining_targets[model_key] > 0):
-                
-                # 남은 목표 대수와 남은 경매 수를 고려한 페널티
-                remaining_needed = sum(new_state.remaining_targets.values())
-                remaining_relevant_auctions = len([a for a in new_state.available_auctions 
-                                                 if new_state.get_model_key(a) in new_state.remaining_targets 
-                                                 and new_state.remaining_targets[new_state.get_model_key(a)] > 0])
-                
-                if remaining_relevant_auctions < remaining_needed:
-                    # 남은 경매보다 필요한 차량이 더 많으면 큰 페널티
-                    reward = -2.0
-                else:
-                    reward = -0.5  # 일반적인 건너뛰기 페널티
-            else:
-                reward = 0  # 목표가 없는 차량은 건너뛰어도 페널티 없음
+            # 건너뛰기 - 상태만 변경, 보상 없음
+            pass
                 
         else:
             # 입찰 시도
@@ -373,106 +404,93 @@ class MCTSAuctionOptimizer:
                 actual_price = int(action.bid_amount * random.uniform(0.85, 1.0))
                 actual_price = max(actual_price, current_auction.min_price)
                 
-                # 상태 업데이트
+                # 상태 업데이트만 - 보상은 에피소드 끝에서
                 new_state.current_budget -= actual_price
                 new_state.current_inventory[model_key] = new_state.current_inventory.get(model_key, 0) + 1
                 
                 if model_key in new_state.remaining_targets:
                     new_state.remaining_targets[model_key] = max(0, new_state.remaining_targets[model_key] - 1)
-                
-                # 보상 계산: 목표 달성에 매우 높은 가중치
-                target_achievement_reward = 5.0  # 목표 달성시 큰 보상
-                
-                # 가격 효율성 보너스 (적게 낼수록 좋음)
-                price_efficiency = max(0, (action.bid_amount - actual_price) / action.bid_amount) * 0.5
-                
-                # 목표 완료에 가까워질수록 추가 보너스
-                total_targets = sum(new_state.current_inventory.values()) + sum(new_state.remaining_targets.values())
-                completion_bonus = (sum(new_state.current_inventory.values()) / total_targets) * 2.0
-                
-                reward = target_achievement_reward + price_efficiency + completion_bonus
-                
-            else:
-                # 낙찰 실패 - 목표 달성이 어려워지므로 페널티
-                remaining_needed = sum(new_state.remaining_targets.values())
-                remaining_relevant_auctions = len([a for a in new_state.available_auctions 
-                                                 if new_state.get_model_key(a) in new_state.remaining_targets 
-                                                 and new_state.remaining_targets[new_state.get_model_key(a)] > 0])
-                
-                if remaining_relevant_auctions < remaining_needed:
-                    reward = -1.5  # 기회를 놓치면 큰 페널티
-                else:
-                    reward = -0.3  # 일반적인 실패 페널티
+            # else: 낙찰 실패 - 상태 변화 없음, 보상도 없음
         
         return new_state, reward
     
     def _simulate(self, state: AuctionState) -> float:
-        """시뮬레이션 - 목표 달성을 최우선으로 하는 휴리스틱"""
+        """
+        시뮬레이션 - 최종 구매 대수만을 기준으로 보상 계산
+        예산 대비 최대한 많은 차량 구매가 목표
+        """
         current_state = deepcopy(state)
-        total_reward = 0
         
         while not current_state.is_terminal() and len(current_state.available_auctions) > 0:
             current_auction = current_state.available_auctions[0]
             model_key = current_state.get_model_key(current_auction)
             
-            # 목표가 있는 차량에 대해서는 더 적극적으로 입찰
+            # 목표가 있는 차량에 대해서는 적극적으로 입찰
             if (model_key in current_state.remaining_targets and 
                 current_state.remaining_targets[model_key] > 0 and
                 current_state.current_budget >= current_auction.min_price):
                 
-                # 남은 목표 대수 vs 남은 경매 수 비율로 공격성 결정
-                remaining_needed = sum(current_state.remaining_targets.values())
+                # 예산 활용도와 남은 경매 수를 고려한 입찰 전략
+                remaining_budget_ratio = current_state.current_budget / state.current_budget
                 remaining_relevant_auctions = len([a for a in current_state.available_auctions 
                                                  if current_state.get_model_key(a) in current_state.remaining_targets 
                                                  and current_state.remaining_targets[current_state.get_model_key(a)] > 0])
                 
-                urgency = remaining_needed / max(remaining_relevant_auctions, 1)
+                # 예산이 많이 남았고 경매가 적다면 더 공격적으로
+                if remaining_budget_ratio > 0.7 and remaining_relevant_auctions <= 3:
+                    multiplier = random.uniform(1.3, 1.7)  # 공격적
+                elif remaining_budget_ratio > 0.4:
+                    multiplier = random.uniform(1.1, 1.4)  # 보통
+                else:
+                    multiplier = random.uniform(1.0, 1.2)  # 보수적
                 
-                if urgency >= 1.2:  # 매우 긴급
-                    multiplier = random.uniform(1.4, 1.8)
-                elif urgency >= 1.0:  # 긴급
-                    multiplier = random.uniform(1.2, 1.5)
-                else:  # 일반
-                    multiplier = random.uniform(1.0, 1.3)
-                
-                max_bid = min(current_state.current_budget, int(current_auction.min_price * multiplier))
+                max_bid = min(current_state.current_budget, 
+                             int(current_auction.min_price * multiplier))
                 action = AuctionAction(current_auction.listing_id, max_bid, "simulation")
             else:
-                # 건너뛰기
+                # 목표가 없거나 예산 부족이면 건너뛰기
                 action = AuctionAction(current_auction.listing_id, 0, "skip")
             
-            current_state, reward = self._apply_action(current_state, action)
-            total_reward += reward
+            current_state, _ = self._apply_action(current_state, action)
         
-        # 최종 보상: 목표 달성률에 매우 높은 가중치
-        initial_total_targets = sum(state.remaining_targets.values()) + sum(state.current_inventory.values())
-        final_achieved = sum(current_state.current_inventory.values())
+        # ===== 핵심: 오직 최종 구매 대수만으로 보상 계산 =====
+        total_purchased = sum(current_state.current_inventory.values())
         
-        if initial_total_targets > 0:
-            achievement_rate = final_achieved / initial_total_targets
-            # 목표 달성률에 따른 강한 보상/페널티
-            if achievement_rate >= 1.0:
-                achievement_reward = 10.0  # 완전 달성시 큰 보상
-            elif achievement_rate >= 0.8:
-                achievement_reward = 5.0
-            elif achievement_rate >= 0.6:
-                achievement_reward = 2.0
+        # 기본 보상: 구매한 차량 수에 비례
+        base_reward = total_purchased * 10.0  # 차량 1대당 10점
+        
+        # 목표 달성 보너스
+        total_targets = sum(state.remaining_targets.values())
+        if total_targets > 0:
+            achievement_rate = total_purchased / total_targets
+            if achievement_rate >= 1.0:  # 목표 완전 달성
+                achievement_bonus = 50.0
+            elif achievement_rate >= 0.8:  # 80% 이상 달성
+                achievement_bonus = 20.0
+            elif achievement_rate >= 0.6:  # 60% 이상 달성
+                achievement_bonus = 10.0
             else:
-                achievement_reward = -5.0 * (1.0 - achievement_rate)  # 미달성시 큰 페널티
+                achievement_bonus = 0
         else:
-            achievement_reward = 0
-            
-        budget_efficiency = current_state.current_budget / state.current_budget * 0.5
+            achievement_bonus = 0
         
-        final_reward = achievement_reward + budget_efficiency
-        return total_reward + final_reward
+        # 예산 효율성 보너스 (남은 예산이 적을수록 좋음, 단 구매를 했을 때만)
+        if total_purchased > 0:
+            budget_utilization = 1.0 - (current_state.current_budget / state.current_budget)
+            efficiency_bonus = budget_utilization * 5.0  # 최대 5점
+        else:
+            efficiency_bonus = 0
+        
+        final_reward = base_reward + achievement_bonus + efficiency_bonus
+        
+        return final_reward
     
     def mcts_search(self, initial_state: AuctionState, iterations: int = 1000) -> MCTSNode:
         """MCTS 검색 실행"""
         root = MCTSNode(initial_state, optimizer=self)
-        
-        pbar = tqdm(range(iterations), desc="MCTS 진행", ncols=100)
-        for i in pbar:
+
+        print(f"[MCTS] Search start - iterations={iterations}")
+        for i in range(iterations):
             # 1. Selection
             node = root
             while not node.state.is_terminal() and node.is_fully_expanded() and node.children:
@@ -495,31 +513,23 @@ class MCTSAuctionOptimizer:
                 node.total_reward += reward
                 node = node.parent
 
-            # tqdm 업데이트
-            if (i + 1) % 50 == 0 or (i + 1) == iterations:
-                if root.visits > 0:
-                    avg_reward = root.total_reward / root.visits
-                else:
-                    avg_reward = 0
+            # 로그
+            if (i + 1) % 500 == 0 or (i + 1) == iterations:
+                avg_reward = root.total_reward / root.visits if root.visits > 0 else 0
                 best_child = max(root.children, key=lambda c: c.visits) if root.children else None
-                best_action = f"{best_child.action.action_type}({best_child.action.bid_amount:,})" if best_child else "N/A"
-                
-                pbar.set_postfix({
-                    "visits": root.visits,
-                    "children": len(root.children),
-                    "avgR": f"{avg_reward:.2f}",
-                    "best": best_action
-                })
+                best_action = (
+                    f"{best_child.action.action_type}({best_child.action.bid_amount:,})"
+                    if best_child else "N/A"
+                )
+                print(f"[MCTS] iter={i+1}/{iterations}, visits={root.visits}, "
+                      f"children={len(root.children)}, avgR={avg_reward:.2f}, best={best_action}")
 
-        pbar.close()
-
-        print(f"\n[MCTS 검색 완료]")
-        print(f"Root visits: {root.visits}, children: {len(root.children)}")
+        print(f"[MCTS 검색 완료] Root visits={root.visits}, children={len(root.children)}")
         if root.children:
             best_child = max(root.children, key=lambda c: c.visits)
             bid_info = f"bid={best_child.action.bid_amount:,}" if best_child.action.bid_amount > 0 else "skip"
-            print(f"Best child: {best_child.action.action_type} ({bid_info}) - visits: {best_child.visits}")
-        
+            print(f"[MCTS] Best child: {best_child.action.action_type} ({bid_info}), visits={best_child.visits}")
+
         return root
     
     def get_best_action_sequence(self, root: MCTSNode, max_depth: int = 10) -> List[AuctionAction]:
@@ -557,13 +567,13 @@ class MCTSAuctionOptimizer:
         for item in auction_schedule:
             auction_item = AuctionItem(
                 listing_id=item.get('listing_id', f"auction_{len(available_auctions)}"),
-                brand=item['brand'],
-                model=item['model'],
-                year=item['year'],
-                mileage_km=item['mileage_km'],
-                auction_house=item['auction_house'],
-                min_price=item['min_price'],
-                date=item['end_date'],
+                brand=item.get('brand'),
+                model=item.get('model'),
+                year=item.get('year'),
+                mileage_km=item.get('mileage_km'),
+                auction_house=item.get('auction_house'),
+                min_price=item.get('min_price'),
+                date=item.get('date'),
                 transmission=item.get('transmission'),
                 fuel=item.get('fuel'),
                 color=item.get('color'),
@@ -647,20 +657,27 @@ class MCTSAuctionOptimizer:
         total_targets = sum(remaining_targets.values())
         success_rate = avg_purchased / total_targets if total_targets > 0 else 0
         
-        print(f"\n[MCTS 최적화 완료]")
-        print(f"루트 노드 방문 횟수: {root.visits}")
-        print(f"루트 노드 평균 보상: {root.total_reward / root.visits:.3f}")
-        print(f"최적 액션 시퀀스 길이: {len(best_actions)}")
-        print(f"100회 시뮬레이션 평균 구매: {avg_purchased:.1f}대")
-        print(f"목표 달성률: {success_rate * 100:.1f}%")
-        
+        message = textwrap.dedent(f"""
+            [MCTS 최적화 완료]
+            - 루트 노드 방문 횟수: {root.visits}
+            - 루트 노드 평균 보상: {root.total_reward / root.visits:.3f}
+            - 최적 액션 시퀀스 길이: {len(best_actions)}
+            - 100회 시뮬레이션 평균 구매: {avg_purchased:.1f}대
+            - 목표 달성률: {success_rate * 100:.1f}%
+        """)
+
+        print(message)
+
         # 목표 달성률이 낮으면 경고
         if success_rate < 0.8:
-            print(f"⚠️  목표 달성률이 {success_rate * 100:.1f}%로 낮습니다.")
-            print("   - 예산 증액을 고려해보세요")
-            print("   - 또는 더 많은 MCTS 반복(iterations)을 시도해보세요")
-        
+            alert_message = textwrap.dedent(f"""
+                ⚠️  목표 달성률이 {success_rate * 100:.1f}%로 낮습니다. 예산 증액을 고려해보세요
+            """)
+            print(alert_message)
+            message += alert_message
+
         return {
+            'message': message,
             'expected_purchase_units': int(avg_purchased),
             'total_expected_cost': int(avg_cost),
             'success_rate': round(success_rate * 100, 2),
@@ -673,13 +690,7 @@ class MCTSAuctionOptimizer:
                 'best_sequence_length': len(best_actions),
                 'total_iterations': iterations,
                 'simulation_runs': 100
-            },
-            # 'detailed_stats': {
-            #     'min_purchased': min([r['purchased'] for r in simulation_results]),
-            #     'max_purchased': max([r['purchased'] for r in simulation_results]),
-            #     'std_purchased': np.std([r['purchased'] for r in simulation_results]),
-            #     'achievement_rate_distribution': [r['purchased'] / total_targets for r in simulation_results]
-            # }
+            }
         }
 
 # 사용 예시 및 테스트
@@ -688,19 +699,58 @@ if __name__ == "__main__":
     np.random.seed(42)
     random.seed(42)
 
-    # 실제 CSV 파일 로드 (주석 해제 시 사용)
-    history_data = pd.read_csv("auction_results.csv")
+    # 실제 CSV 파일 로드
+    # history_data = pd.read_csv("auction_results.csv")
+    
+    # 테스트용 샘플 데이터 생성
+    sample_data = []
+    brands_models = [
+        ('현대', '아반떼'), ('기아', 'K5'), ('현대', '소나타'), 
+        ('기아', '스포티지'), ('현대', '투싼')
+    ]
+    
+    for _ in range(3000):
+        brand, model = random.choice(brands_models)
+        year = random.choice([2020, 2021, 2022, 2023])
+        mileage = random.randint(10000, 80000)
+        
+        base_price = {
+            ('현대', '아반떼'): 15000000,
+            ('기아', 'K5'): 18000000,
+            ('현대', '소나타'): 20000000,
+            ('기아', '스포티지'): 25000000,
+            ('현대', '투싼'): 23000000
+        }[brand, model]
+        
+        age_discount = (2024 - year) * 0.1
+        mileage_discount = (mileage / 100000) * 0.15
+        price = int(base_price * (1 - age_discount - mileage_discount) * random.uniform(0.85, 1.15))
+        
+        sample_data.append({
+            'brand': brand,
+            'model': model,
+            'year': year,
+            'mileage_km': mileage,
+            'transmission': random.choice(['오토', '수동']),
+            'fuel': random.choice(['가솔린', '디젤', '하이브리드']),
+            'color': random.choice(['흰색', '검정', '은색', '회색']),
+            'displacement_cc': random.choice([1600, 2000, 2400]),
+            'auction_house': random.choice(['오토허브', '엔카오토', '케이카']),
+            'winning_price': price,
+            'auction_date': datetime.now() - timedelta(days=random.randint(1, 365))
+        })
+    
+    history_data = pd.DataFrame(sample_data)
     
     # MCTS 최적화 시스템 초기화
     optimizer = MCTSAuctionOptimizer(history_data)
-    
-    # 최적화 입력 - 더 도전적인 시나리오
+
     optimization_input = {
         'month': '2025-08-25',
         'budget': 100000000,  # 1억원
         'purchase_plans': [
-            {'brand': '현대', 'model': '아반떼', 'year': 2023, 'target_units': 10},
-            {'brand': '기아', 'model': 'K5', 'year': 2022, 'target_units': 10}
+            {'brand': '현대', 'model': '아반떼', 'year': 2023, 'target_units': 3},
+            {'brand': '기아', 'model': 'K5', 'year': 2022, 'target_units': 2}
         ],
         'auction_schedule': [
             {
@@ -755,14 +805,14 @@ if __name__ == "__main__":
         ]
     }
     
-    # MCTS 최적화 실행 - 더 많은 반복으로 목표 달성 향상
+    # MCTS 최적화 실행
     print("=" * 60)
     print("MCTS 기반 중고차 경매 최적화 시작")
     print("=" * 60)
     
     result = optimizer.optimize_auction_strategy(
         optimization_input=optimization_input,
-        iterations=20000  # 더 많은 반복으로 목표 달성률 향상
+        iterations=2000
     )
     
     print("\n" + "=" * 60)
