@@ -1,10 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BASE_DIR="/opt/autoinside_crawler"
-CRON_CMD="${BASE_DIR}/run_crawler.sh"
+CRON_CMD="/opt/auction_crawler/run_crawler.sh"
 
-# Crontab에서 해당 명령어를 찾아 삭제합니다.
-( crontab -l 2>/dev/null | grep -v "$CRON_CMD" ) | crontab -
+# 대상 사용자 (기본: 현재 사용자). 예) TARGET_USER=root ./unregister_autoinside_schedule_tue_sat.sh
+TARGET_USER="${TARGET_USER:-}"
 
-echo "[INFO] Autoinside 크롤러의 자동 실행 스케줄이 삭제되었습니다."
+if [[ -n "${TARGET_USER}" ]]; then
+  CRONTAB_LIST=(crontab -u "${TARGET_USER}" -l)
+  CRONTAB_APPLY=(crontab -u "${TARGET_USER}")
+else
+  CRONTAB_LIST=(crontab -l)
+  CRONTAB_APPLY=(crontab)
+fi
+
+TMP_IN="$(mktemp)"
+TMP_OUT="$(mktemp)"
+{ "${CRONTAB_LIST[@]}" 2>/dev/null || true; } > "${TMP_IN}"
+awk -v cmd="$CRON_CMD" 'index($0,cmd)==0' "${TMP_IN}" > "${TMP_OUT}"
+"${CRONTAB_APPLY[@]}" "${TMP_OUT}"
+rm -f "${TMP_IN}" "${TMP_OUT}"

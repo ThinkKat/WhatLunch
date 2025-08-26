@@ -1,36 +1,30 @@
 #!/bin/bash
 set -euo pipefail
 
-# --- 설정 ---
 APP_DIR="/app"
-S3_BUCKET="whatlunch-s3"
-S3_BASE_PATH="onbid"
+S3_BUCKET="whatlunch-s3"          # 필요시 환경변수로 주면: S3_BUCKET=${S3_BUCKET:-whatlunch-s3}
+S3_PREFIX_RAW="raw/onbid"
 
-# --- 날짜 및 경로 변수 설정 ---
-TARGET_DATE=$(date -d "yesterday" +"%Y-%m-%d")
-TARGET_DATE_NODASH=$(date -d "yesterday" +"%Y%m%d")
+# 어제 날짜 (KST)
+TARGET_DATE=$(TZ=Asia/Seoul date -d "yesterday" +"%Y-%m-%d")
+TARGET_DATE_NODASH=$(TZ=Asia/Seoul date -d "yesterday" +"%Y%m%d")
 
-# 로그 파일 경로
 LOG_DIR="${APP_DIR}/logs"
 LOG_FILE="${LOG_DIR}/crawl_${TARGET_DATE_NODASH}.log"
 
-# 데이터 저장 경로
 BASE_OUT_FILE="${APP_DIR}/base/${TARGET_DATE}.json"
-FINAL_CSV_DIR="${APP_DIR}/result/${S3_BASE_PATH}/${TARGET_DATE}"
+FINAL_CSV_DIR="${APP_DIR}/result/onbid/${TARGET_DATE}"
 FINAL_CSV_FILE="${FINAL_CSV_DIR}/onbid-${TARGET_DATE_NODASH}-raw.csv"
 
-# --- 디렉토리 생성 ---
 mkdir -p "${APP_DIR}/base" "$FINAL_CSV_DIR" "$LOG_DIR"
 
-# --- 환경 설정 및 의존성 설치 ---
-echo "[INFO] Setting up environment..."
-if [ -f "${APP_DIR}/requirements.txt" ]; then
-    pip install -r "${APP_DIR}/requirements.txt"
-fi
-playwright install firefox
+export PYTHONUNBUFFERED=1
+exec > >(tee -a "$LOG_FILE") 2>&1
 
-# --- 스크립트 실행 ---
-echo "[INFO] Running crawl_base.py... Date: ${TARGET_DATE}"
+echo "[INFO] Starting onbid (Date=${TARGET_DATE})"
+echo "[INFO] Dependencies are assumed preinstalled in the image."
+
+# === base 수집 ===
 python "${APP_DIR}/onbid/crawl_base.py" \
   --mode HISTORY \
   --from "$TARGET_DATE" \
@@ -39,12 +33,13 @@ python "${APP_DIR}/onbid/crawl_base.py" \
   --out "$BASE_OUT_FILE" \
   --max-pages 500
 
-if [ ! -f "$BASE_OUT_FILE" ]; then
-    echo "[ERROR] Base JSON file not found: $BASE_OUT_FILE" | tee -a "$LOG_FILE"
-    exit 1
+if [ ! -s "$BASE_OUT_FILE" ]; then
+  echo "[ERROR] Base JSON missing or empty: $BASE_OUT_FILE"
+  exit 1
 fi
+echo "[OK] Base JSON -> $BASE_OUT_FILE"
 
-echo "[INFO] Running crawl_detail.py... Input: ${BASE_OUT_FILE}"
+# === detail 수집 ===
 python "${APP_DIR}/onbid/crawl_detail.py" \
   --mode HISTORY \
   --input "$BASE_OUT_FILE" \
@@ -53,21 +48,43 @@ python "${APP_DIR}/onbid/crawl_detail.py" \
   --retries 3 \
   --log-file "$LOG_FILE"
 
-# --- 결과 확인 및 S3 업로드 ---
-if [ -f "$FINAL_CSV_FILE" ]; then
-    echo "[OK] Crawling successful, data found -> ${FINAL_CSV_FILE}"
-    
-    # S3로 결과 및 로그 파일 업로드 (필요시 주석 해제)
-    # S3_TARGET_PATH="s3://${S3_BUCKET}/${S3_BASE_PATH}/${TARGET_DATE}/"
-    # echo "[INFO] Uploading result to S3 -> ${S3_TARGET_PATH}"
-    # aws s3 cp "${FINAL_CSV_FILE}" "${S3_TARGET_PATH}"
-    # aws s3 cp "${LOG_FILE}" "${S3_TARGET_PATH}"
+if [ -s "$FINAL_CSV_FILE" ]; then
+  echo "[OK] Detail CSV -> ${FINAL_CSV_FILE}"
 else
-    echo "[OK] Crawling successful, no data for today. Skipping file creation and upload."
-    # 데이터가 없더라도 로그 파일은 S3로 업로드 할 수 있습니다 (필요시 주석 해제)
-    # S3_TARGET_PATH="s3://${S3_BUCKET}/${S3_BASE_PATH}/${TARGET_DATE}/"
-    # echo "[INFO] Uploading log file to S3 -> ${S3_TARGET_PATH}"
-    # aws s3 cp "${LOG_FILE}" "${S3_TARGET_PATH}"
+  echo "[WARN] Detail finished but no data; CSV not created or empty."
 fi
 
-echo "[INFO] onbid_daily done."
+# === S3 업로드 (boto3 사용: aws CLI 불필요) ===
+#   CSV  : s3://$S3_BUCKET/raw/onbid/YYYY-MM-DD/onbid-YYYYMMDD-raw.csv
+#   로그 : s3://$S3_BUCKET/logs/onbid/YYYY-MM-DD/crawl_YYYYMMDD.log
+python - <<'PY' "$FINAL_CSV_FILE" "$LOG_FILE" "$S3_BUCKET" "$TARGET_DATE" "$TARGET_DATE_NODASH"
+import sys, os
+csv_path, log_path, bucket, date_folder, date_nodash = sys.argv[1:6]
+
+# boto3 필요
+try:
+    import boto3
+except Exception as e:
+    print(f"[ERROR] boto3 is not installed: {e}")
+    raise SystemExit(2)
+
+s3 = boto3.client("s3")
+site = "onbid"
+
+def upload_if_exists(local_path: str, key: str):
+    if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+        s3.upload_file(local_path, bucket, key)
+        print(f"[OK] Uploaded s3://{bucket}/{key}")
+    else:
+        print(f"[WARN] Skip upload (missing/empty): {local_path}")
+
+# CSV 업로드 (있을 때만)
+csv_key = f"raw/{site}/{date_folder}/onbid-{date_nodash}-raw.csv"
+upload_if_exists(csv_path, csv_key)
+
+# 로그 업로드
+log_key = f"logs/{site}/{date_folder}/crawl_{date_nodash}.log"
+upload_if_exists(log_path, log_key)
+PY
+
+echo "[INFO] onbid_daily done (CSV + log uploaded via boto3)."
