@@ -1,0 +1,21 @@
+*.txt
+*.json
+*.csv
+*.html
+*.db
+*.log
+.DS_Store
+._.DS_Store
+**/.DS_Store
+**/._.DS_Store
+*.png
+*.env
+
+*__pycache__
+
+# light gbm
+*.cbm
+
+# catboost
+*.tfevents
+*.tsv
