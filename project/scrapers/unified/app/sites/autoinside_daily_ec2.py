@@ -50,7 +50,7 @@ DETAIL_PAGE_URL_TEMPLATE = (
     "https://auction.autoinside.co.kr/auction/auction_car_view.do?i_sEntryCd={entry_cd}"
 )
 S3_BUCKET_NAME = BUCKET
-CONCURRENT_REQUESTS = 2
+CONCURRENT_REQUESTS = 5
 MAX_RETRIES = 3
 
 import re as _re
