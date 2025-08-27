@@ -4,8 +4,16 @@ FROM mcr.microsoft.com/playwright/python:v1.47.0-jammy
 # 작업 디렉토리를 설정합니다.
 WORKDIR /app
 
-# 타임존을 서울로 설정합니다.
-ENV TZ=Asia/Seoul
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && \
+    apt-get install -y tzdata && \
+    ln -fs /usr/share/zoneinfo/Asia/Seoul /etc/localtime && \
+    dpkg-reconfigure -f noninteractive tzdata && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    TZ=Asia/Seoul
 
 # requirements.txt를 복사하고 라이브러리를 설치합니다.
 COPY requirements.txt .
