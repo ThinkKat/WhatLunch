@@ -1,0 +1,12 @@
+services:
+  health-dashboard:
+    build: .
+    environment:
+      - BUCKET=whatlunch-s3
+      - SITES=onbid,autohub,autoinside,automart
+      - AWS_REGION=ap-northeast-2
+      # - CSV_MIN_BYTES=200
+      # - LOG_MIN_BYTES=1
+    ports:
+      - "80:8080"   # 외부 80 → 컨테이너 8080
+    restart: unless-stopped

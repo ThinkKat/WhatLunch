@@ -1,6 +1,7 @@
 import asyncio
 import re
 import csv
+import io
 import os
 import boto3
 from datetime import datetime, timedelta
@@ -43,9 +44,6 @@ async def extract_data_from_page(page, yesterday_str):
             auction_date = await cols[0].inner_text()
 
             if auction_date != yesterday_str:
-                logging.info(
-                    f"어제({yesterday_str})와 다른 날짜({auction_date})의 데이터를 발견하여 수집을 중단합니다."
-                )
                 should_stop_globally = True
                 break
 
@@ -89,12 +87,48 @@ async def extract_data_from_page(page, yesterday_str):
 
     except PlaywrightError as e:
         if "Execution context was destroyed" in str(e):
-            logging.warning("페이지 이동 중 컨텍스트가 파괴되어 재시도합니다.")
             error_occurred = True
         else:
+            logger.error(f"Playwright 오류 발생: {e}")
             raise e
 
     return yesterdays_data, should_stop_globally, error_occurred
+
+
+async def save_data_to_s3(data, target_date):
+    """
+    수집된 데이터를 S3에 CSV 파일로 업로드합니다.
+    """
+    if not data:
+        logger.warning("S3에 업로드할 데이터가 없습니다.")
+        return
+
+    folder_date = target_date.strftime("%Y-%m-%d")
+    file_date = target_date.strftime("%Y%m%d")
+    s3_key = f"raw/{SITE}/{folder_date}/{SITE}-{file_date}-raw.csv"
+
+    logger.info(
+        f"수집된 {len(data)}개 데이터를 s3://{BUCKET}/{s3_key} 경로에 업로드합니다."
+    )
+
+    csv_buffer = io.StringIO()
+    # 데이터의 첫 번째 항목을 기반으로 필드 이름 동적 생성
+    fieldnames = list(data[0].keys()) if data else []
+
+    writer = csv.DictWriter(csv_buffer, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(data)
+
+    s3 = boto3.client("s3")
+    try:
+        s3.put_object(
+            Bucket=BUCKET,
+            Key=s3_key,
+            Body=csv_buffer.getvalue().encode("utf-8-sig"),
+        )
+        logger.info("✔️ S3 업로드 완료!")
+    except Exception as e:
+        logger.error(f"❌ S3 업로드 중 오류 발생: {e}")
 
 
 async def main():
@@ -114,10 +148,11 @@ async def main():
         )
 
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+            browser = await p.chromium.launch(headless=True)
             page = await browser.new_page()
 
             logging.info("🚀 페이지로 이동합니다: https://www.sellcarauction.co.kr/...")
+
             await page.goto(
                 "https://www.sellcarauction.co.kr/newfront/successfulbid/sb/front_successfulbid_sb_list.do",
                 timeout=60000,
@@ -148,7 +183,7 @@ async def main():
                             timeout=10000,
                         )
                     except PlaywrightTimeoutError:
-                        logging.warning(
+                        logger.warning(
                             f"⚠️ 페이지 {page_num} 로딩 시간 초과. {attempt + 1}/{MAX_RETRIES}번째 재시도..."
                         )
                         await page.reload()
@@ -176,7 +211,7 @@ async def main():
 
                 if success_on_page and current_page_data:
                     all_car_data.extend(current_page_data)
-                    logging.info(
+                    logger.info(
                         f"✔️ {len(current_page_data)}개 차량 정보 수집 완료. (총 {len(all_car_data)}개)"
                     )
                 elif success_on_page and not stop_crawling:
