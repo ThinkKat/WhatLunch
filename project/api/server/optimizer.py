@@ -3,50 +3,80 @@ import numpy as np
 import math
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 import random
 import json
 from collections import defaultdict
 from copy import deepcopy
-from tqdm import tqdm
 import textwrap
+import logging
+
+# 로깅 설정
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 @dataclass
 class AuctionItem:
     listing_id: str
     brand: str
-    model: str
-    year: int
-    mileage_km: int
-    auction_house: str
-    min_price: int
-    date: str
-    transmission: str = None
-    fuel: str = None
-    color: str = None
-    displacement_cc: int = None
+    model: Optional[str] = None
+    year: Optional[int] = None
+    mileage_km: Optional[int] = None
+    auction_house: str = None
+    min_price: int = 0
+    date: str = None
+    transmission: Optional[str] = None
+    fuel: Optional[str] = None
+    color: Optional[str] = None
+    displacement_cc: Optional[int] = None
+    priority_score: float = 0.0
 
 @dataclass
 class AuctionState:
     """MCTS 노드의 상태를 나타내는 클래스"""
     current_budget: int
-    remaining_targets: Dict[str, int]  # 모델별 남은 구매 목표 {"현대_아반떼_2023": 50}
-    available_auctions: List[AuctionItem]  # 남은 경매들
-    current_inventory: Dict[str, int]  # 현재까지 구매한 수량
-    time_step: int  # 현재 시점 (몇 번째 의사결정인지)
+    remaining_targets: Dict[str, int]
+    available_auctions: List[AuctionItem]
+    current_inventory: Dict[str, int]
+    time_step: int
+    total_auctions: int = 0
     
     def is_terminal(self) -> bool:
-        """터미널 상태인지 확인 (더 이상 진행할 수 없는 상태)"""
-        # 목표를 모두 달성했거나, 경매가 없거나, 예산이 없는 경우
-        targets_achieved = sum(self.remaining_targets.values()) <= 0
-        no_auctions = len(self.available_auctions) == 0
-        no_budget = self.current_budget <= 0
-        
-        return targets_achieved or no_auctions or no_budget
+        """터미널 상태 확인"""
+        if self.current_budget <= 0:
+            return True
+        if len(self.available_auctions) == 0:
+            return True
+        if sum(self.remaining_targets.values()) <= 0:
+            return True
+        return False
     
-    def get_model_key(self, auction_item: AuctionItem) -> str:
-        """경매 아이템으로부터 모델 키 생성"""
-        return f"{auction_item.brand}_{auction_item.model}_{auction_item.year}"
+    def get_model_key(self, auction_item: AuctionItem, level: int = 0) -> str:
+        """계층적 모델 키 생성"""
+        brand = auction_item.brand or "unknown"
+        model = auction_item.model or "any"
+        year = auction_item.year or 0
+        
+        if level == 0:  # 완전 매칭
+            return f"{brand}_{model}_{year}"
+        elif level == 1:  # 모델까지만
+            return f"{brand}_{model}"
+        elif level == 2:  # 브랜드만
+            return f"{brand}"
+        else:
+            return "any"
+    
+    def find_matching_targets(self, auction_item: AuctionItem) -> List[Tuple[str, int]]:
+        """경매 아이템에 매칭되는 목표들을 찾음"""
+        matches = []
+        
+        for level in range(4):
+            key = self.get_model_key(auction_item, level)
+            if key in self.remaining_targets and self.remaining_targets[key] > 0:
+                matches.append((key, level))
+        
+        matches.sort(key=lambda x: x[1])
+        return matches
     
     def get_target_achievement_rate(self) -> float:
         """목표 달성률 계산"""
@@ -56,161 +86,97 @@ class AuctionState:
 
 @dataclass
 class AuctionAction:
-    """MCTS 액션을 나타내는 클래스"""
+    """MCTS 액션"""
     auction_id: str
-    bid_amount: int  # 0이면 건너뛰기
-    action_type: str  # "skip", "conservative", "moderate", "aggressive"
+    bid_amount: int
+    action_type: str
+    target_key: str = None
 
 class MCTSNode:
     """MCTS 트리의 노드"""
     def __init__(self, state: AuctionState, action: AuctionAction = None, parent=None, optimizer=None):
         self.state = state
-        self.action = action  # 이 노드에 도달한 액션
+        self.action = action
         self.parent = parent
         self.optimizer = optimizer
         self.children = []
         self.visits = 0
         self.total_reward = 0.0
         self.untried_actions = []
+        self._action_cache = {}
         self._initialize_actions()
     
     def _initialize_actions(self):
-        """현재 상태에서 가능한 액션들 초기화 - 목표 달성을 최우선으로"""
+        """액션 초기화"""
         if self.state.is_terminal():
             return
             
-        if self.state.available_auctions:
-            current_auction = self.state.available_auctions[0]
-            model_key = self.state.get_model_key(current_auction)
+        if not self.state.available_auctions:
+            return
             
-            # 해당 모델이 구매 목표에 있고, 아직 목표 달성 안 했다면
-            if (model_key in self.state.remaining_targets and 
-                self.state.remaining_targets[model_key] > 0):
+        current_auction = self.state.available_auctions[0]
+        
+        cache_key = f"{current_auction.listing_id}_{self.state.current_budget}"
+        if cache_key in self._action_cache:
+            self.untried_actions = self._action_cache[cache_key].copy()
+            return
+        
+        actions = []
+        matching_targets = self.state.find_matching_targets(current_auction)
+        
+        if matching_targets:
+            if self.state.current_budget >= current_auction.min_price:
+                max_affordable = min(self.state.current_budget, current_auction.min_price * 2.0)
                 
-                # 과거 데이터에서 유사 차량의 실제 낙찰가들 가져오기
-                historical_prices = self._get_historical_bid_prices(current_auction)
+                best_match_level = matching_targets[0][1]
                 
-                if historical_prices:
-                    valid_prices = [p for p in historical_prices if p >= current_auction.min_price]
-                    
-                    if valid_prices:
-                        affordable_prices = [p for p in valid_prices if p <= self.state.current_budget]
-                        
-                        if affordable_prices:
-                            sorted_prices = sorted(affordable_prices)
-                            n = len(sorted_prices)
-                            
-                            # 목표 달성을 위해 더 공격적인 입찰 전략 추가
-                            remaining_total = sum(self.state.remaining_targets.values())
-                            remaining_auctions = len([a for a in self.state.available_auctions 
-                                                    if self.state.get_model_key(a) in self.state.remaining_targets 
-                                                    and self.state.remaining_targets[self.state.get_model_key(a)] > 0])
-                            
-                            urgency_factor = remaining_total / max(remaining_auctions, 1)
-                            
-                            if urgency_factor >= 1.0:  # 매우 긴급한 상황
-                                percentiles = [0.4, 0.6, 0.8, 0.95]  # 더 공격적
-                                action_types = ["moderate", "aggressive", "very_aggressive", "desperate"]
-                            else:  # 일반적인 상황
-                                percentiles = [0.25, 0.5, 0.75, 0.9]
-                                action_types = ["conservative", "moderate", "aggressive", "very_aggressive"]
-                            
-                            used_prices = set()
-                            for percentile, action_type in zip(percentiles, action_types):
-                                idx = min(int(n * percentile), n - 1)
-                                bid_price = sorted_prices[idx]
-                                
-                                if bid_price not in used_prices and bid_price >= current_auction.min_price:
-                                    self.untried_actions.append(
-                                        AuctionAction(current_auction.listing_id, bid_price, action_type)
-                                    )
-                                    used_prices.add(bid_price)
-                                    
-                            # 목표 달성이 어려운 상황에서는 skip 액션의 우선순위를 낮춤
-                            if urgency_factor < 0.8:  # 여유가 있을 때만 skip 추가
-                                self.untried_actions.append(
-                                    AuctionAction(current_auction.listing_id, 0, "skip")
-                                )
-                        else:
-                            # 예산 부족하지만 목표 달성이 중요한 경우
-                            if current_auction.min_price <= self.state.current_budget:
-                                self.untried_actions.append(
-                                    AuctionAction(current_auction.listing_id, current_auction.min_price, "min_price")
-                                )
-                else:
-                    # 과거 데이터가 없는 경우 - 목표 달성을 위해 더 적극적
-                    min_bid = current_auction.min_price
-                    max_affordable = min(self.state.current_budget, min_bid * 2.0)  # 더 넉넉한 범위
-                    
-                    if max_affordable >= min_bid:
-                        fallback_multipliers = [1.1, 1.3, 1.5, 1.8]  # 더 공격적인 배수
-                        fallback_types = ["conservative", "moderate", "aggressive", "very_aggressive"]
-                        
-                        for multiplier, action_type in zip(fallback_multipliers, fallback_types):
-                            bid_price = int(min_bid * multiplier)
-                            if bid_price <= max_affordable:
-                                self.untried_actions.append(
-                                    AuctionAction(current_auction.listing_id, bid_price, action_type)
-                                )
-            else:
-                # 구매 목표가 없는 경매는 건너뛰기만
-                self.untried_actions.append(
-                    AuctionAction(current_auction.listing_id, 0, "skip")
-                )
-    
-    def _get_historical_bid_prices(self, auction_item: AuctionItem) -> List[int]:
-        """과거 유사 차량의 실제 낙찰가 데이터 가져오기"""
-        if not self.optimizer:
-            return []
-            
-        try:
-            similar_indices = self.optimizer._find_similar_cars(auction_item)
-            
-            if not similar_indices:
-                return []
-            
-            historical_prices = []
-            for idx in similar_indices:
-                car_info = self.optimizer.processed_data.iloc[idx]
-                price_list = car_info['price_list']
-                date_list = car_info['date_list']
+                if best_match_level == 0:  # 완전 매칭
+                    multipliers = [1.05, 1.1, 1.15, 1.2, 1.3]
+                elif best_match_level == 1:  # 모델 매칭
+                    multipliers = [1.08, 1.13, 1.18, 1.25]
+                elif best_match_level == 2:  # 브랜드 매칭
+                    multipliers = [1.12, 1.18, 1.25]
+                else:  # 일반 매칭
+                    multipliers = [1.15, 1.22]
                 
-                time_weights = self.optimizer._calculate_time_weights(date_list)
+                action_types = ["conservative", "moderate", "aggressive", "very_aggressive", "urgent"][:len(multipliers)]
                 
-                for price, weight in zip(price_list, time_weights):
-                    repeat_count = max(1, int(weight * 5))
-                    historical_prices.extend([int(price)] * repeat_count)
-            
-            unique_prices = sorted(list(set(historical_prices)))
-            return unique_prices
-            
-        except Exception as e:
-            print(f"과거 가격 데이터 가져오기 실패: {e}")
-            return []
+                for multiplier, action_type in zip(multipliers, action_types):
+                    bid_price = int(current_auction.min_price * multiplier)
+                    if bid_price <= max_affordable:
+                        target_key = matching_targets[0][0]
+                        action = AuctionAction(current_auction.listing_id, bid_price, action_type, target_key)
+                        actions.append(action)
+                
+                total_remaining = sum(self.state.remaining_targets.values())
+                remaining_relevant = len([a for a in self.state.available_auctions[:10]
+                                        if self.state.find_matching_targets(a)])
+                
+                if total_remaining <= remaining_relevant * 0.8:
+                    actions.append(AuctionAction(current_auction.listing_id, 0, "skip"))
+        else:
+            actions.append(AuctionAction(current_auction.listing_id, 0, "skip"))
+        
+        self.untried_actions = actions
+        self._action_cache[cache_key] = actions.copy()
     
     def is_fully_expanded(self) -> bool:
-        """모든 가능한 액션이 확장되었는지"""
         return len(self.untried_actions) == 0
     
     def uct_value(self, c=1.414) -> float:
-        """UCT 값 계산 - 목표 달성률을 고려한 보정"""
+        """UCT 값 계산"""
         if self.visits == 0:
             return float('inf')
         
         exploitation = self.total_reward / self.visits
         exploration = c * math.sqrt(math.log(self.parent.visits) / self.visits)
         
-        # 목표 달성이 어려운 상황에서는 exploration을 더 강화
-        achievement_rate = self.state.get_target_achievement_rate()
-        if achievement_rate < 0.5:  # 목표 달성률이 50% 미만이면
-            exploration *= 1.5  # exploration 가중치 증가
-        
         return exploitation + exploration
     
     def best_child(self, c=1.414):
-        """UCT 기준으로 최고의 자식 노드 선택"""
+        """최고의 자식 노드 선택"""
         if not self.children:
-            raise ValueError(f"Node has no children. State: terminal={self.state.is_terminal()}, visits={self.visits}")
+            raise ValueError("Node has no children")
         return max(self.children, key=lambda child: child.uct_value(c))
     
     def add_child(self, action: AuctionAction, state: AuctionState):
@@ -221,43 +187,143 @@ class MCTSNode:
         return child
 
 class MCTSAuctionOptimizer:
-    def __init__(self, historical_data: pd.DataFrame):
-        """MCTS 기반 중고차 경매 최적화 시스템"""
+    """MCTS 경매 최적화 시스템"""
+    
+    def __init__(self, historical_data: pd.DataFrame, config: Dict = None):
         self.historical_data = historical_data
         self.current_date = datetime.now()
+        
+        default_config = {
+            'lookahead_window': 100,
+            'max_tree_depth': 15,
+            'simulation_length': 20,
+            'parallel_simulations': 8,
+            'adaptive_iterations': True,
+            'memory_limit_mb': 1000,
+            'cache_size': 20000,
+            'early_termination': True,
+            'quality_threshold': 0.8,
+            'brand_priority_weight': 1.0,
+            'model_priority_weight': 0.8,
+            'year_priority_weight': 0.6,
+        }
+        
+        self.config = {**default_config, **(config or {})}
+        
+        if len(historical_data) > 10000:
+            self.config.update({
+                'simulation_length': 15,
+                'max_tree_depth': 12,
+                'cache_size': 50000,
+            })
+        
         self._preprocess_data()
+        self._setup_caches()
+
+    def _should_terminate_early(self, root: MCTSNode, iteration: int, total_iterations: int) -> bool:
+        """조기 종료 조건 확인"""
+        if not self.config.get('early_termination', False):
+            return False
+        
+        if iteration < max(100, total_iterations * 0.1):
+            return False
+        
+        if iteration % 50 == 0 and iteration > 200:
+            if root.children:
+                best_child = max(root.children, key=lambda c: c.visits)
+                visit_ratio = best_child.visits / root.visits
+                
+                if visit_ratio > 0.8:
+                    logger.info(f"조기 종료: iteration {iteration}에서 수렴 감지")
+                    return True
+        
+        return False
+        
+    def _setup_caches(self):
+        """캐시 초기화"""
+        self._similarity_cache = {}
+        self._probability_cache = {}
+        self._price_cache = {}
+        self._cache_hits = 0
+        self._cache_misses = 0
         
     def _preprocess_data(self):
-        """기존 CarAuctionOptimizer와 동일한 전처리"""
-        columns_for_key = [col for col in self.historical_data.columns if col not in ['winning_price', 'auction_date']]
-
-        self.historical_data["auction_date"] = pd.to_datetime(self.historical_data["auction_date"], format='mixed')
-        self.historical_data["age"] = self.historical_data["auction_date"].dt.year - self.historical_data["year"] 
-
-        def q50(x): return x.quantile(0.5)
-        def q75(x): return x.quantile(0.75)
-        def q90(x): return x.quantile(0.9)
+        """데이터 전처리"""
+        logger.info("데이터 전처리 시작...")
         
-        self.processed_data = (
-            self.historical_data.groupby(columns_for_key, dropna=False)
-            .agg(
-                reliability=("winning_price","count"),
-                min=("winning_price","min"),
-                max=("winning_price","max"),
-                mean=("winning_price","mean"),
-                median=("winning_price","median"),
-                std=("winning_price","std"),
-                q50=("winning_price", q50),
-                q75=("winning_price", q75),
-                q90=("winning_price", q90),
-                price_list=("winning_price", lambda x: list(x)),
-                date_list=("auction_date",  lambda x: list(x)),
-            )
-            .reset_index()
+        self.historical_data = self.historical_data.copy()
+        self.historical_data['brand'] = self.historical_data['brand'].fillna('unknown')
+        self.historical_data['model'] = self.historical_data['model'].fillna('any')
+        self.historical_data['year'] = pd.to_numeric(self.historical_data['year'], errors='coerce').fillna(0).astype(int)
+        self.historical_data['mileage_km'] = pd.to_numeric(self.historical_data['mileage_km'], errors='coerce').fillna(0).astype(int)
+
+        self.historical_data["auction_date"] = pd.to_datetime(
+            self.historical_data["auction_date"], format='mixed'
+        )
+        self.historical_data["age"] = np.maximum(0, 
+            self.historical_data["auction_date"].dt.year - self.historical_data["year"]
         )
 
-        self.processed_data["price_range"] = self.processed_data["max"] - self.processed_data["min"]
-        print(f"[전처리 완료] {len(self.processed_data)}개 차량 데이터")
+        grouping_columns = []
+        for col in self.historical_data.columns:
+            if col not in ['winning_price', 'auction_date', 'age']:
+                grouping_columns.append(col)
+
+        def q50(x): return x.quantile(0.5) if len(x) > 0 else 0
+        def q75(x): return x.quantile(0.75) if len(x) > 0 else 0
+        def q90(x): return x.quantile(0.9) if len(x) > 0 else 0
+        
+        try:
+            self.processed_data = (
+                self.historical_data.groupby(grouping_columns, dropna=False)
+                .agg(
+                    reliability=("winning_price", "count"),
+                    min=("winning_price", "min"),
+                    max=("winning_price", "max"),
+                    mean=("winning_price", "mean"),
+                    median=("winning_price", "median"),
+                    std=("winning_price", "std"),
+                    q50=("winning_price", q50),
+                    q75=("winning_price", q75),
+                    q90=("winning_price", q90),
+                    price_list=("winning_price", lambda x: list(x)),
+                    date_list=("auction_date", lambda x: list(x)),
+                )
+                .reset_index()
+            )
+
+            self.processed_data["price_range"] = self.processed_data["max"] - self.processed_data["min"]
+            
+            self._create_lookup_indices()
+            
+            logger.info(f"전처리 완료 - {len(self.processed_data)}개 차량 데이터")
+            
+        except Exception as e:
+            logger.error(f"전처리 중 오류 발생: {e}")
+            self.processed_data = pd.DataFrame()
+            self._create_lookup_indices()
+    
+    def _create_lookup_indices(self):
+        """계층적 검색 인덱스 생성"""
+        self.brand_exact_index = defaultdict(list)
+        self.brand_model_index = defaultdict(list)
+        self.brand_only_index = defaultdict(list)
+        
+        if self.processed_data.empty:
+            return
+            
+        for idx, row in self.processed_data.iterrows():
+            brand = row.get('brand', 'unknown')
+            model = row.get('model', 'any')
+            year = row.get('year', 0)
+            
+            exact_key = f"{brand}_{model}_{year}"
+            self.brand_exact_index[exact_key].append(idx)
+            
+            model_key = f"{brand}_{model}"
+            self.brand_model_index[model_key].append(idx)
+            
+            self.brand_only_index[brand].append(idx)
     
     def _calculate_time_weights(self, dates: List[datetime]) -> List[float]:
         """시간 가중치 계산"""
@@ -269,277 +335,362 @@ class MCTSAuctionOptimizer:
         return weights
     
     def _find_similar_cars(self, auction_item: AuctionItem) -> List[int]:
-        """유사한 차량 인덱스 찾기 - 계층적 유사도 검색"""
+        """계층적 유사 차량 검색"""
+        brand = auction_item.brand or "unknown"
+        model = auction_item.model or "any"
+        year = auction_item.year or 0
         
-        # 1차: 정확한 브랜드+모델 매칭
-        exact_match_df = self.processed_data[
-            (self.processed_data['brand'] == auction_item.brand) & 
-            (self.processed_data['model'] == auction_item.model)
-        ]
+        cache_key = f"{brand}_{model}_{year}_{auction_item.mileage_km or 0}"
         
-        if len(exact_match_df) > 0:
-            similar_indices = []
-            for idx, row in exact_match_df.iterrows():
-                year_diff = abs(auction_item.year - row['year'])
-                mileage_diff = abs(auction_item.mileage_km - row['mileage_km'])
-                
-                if year_diff <= 2 and mileage_diff <= 30000:
-                    original_idx = self.processed_data.index.get_loc(idx)
-                    similar_indices.append(original_idx)
+        if cache_key in self._similarity_cache:
+            self._cache_hits += 1
+            return self._similarity_cache[cache_key]
+        
+        self._cache_misses += 1
+        similar_indices = []
+        
+        # 1단계: 완전 매칭
+        exact_key = f"{brand}_{model}_{year}"
+        candidates = self.brand_exact_index.get(exact_key, [])
+        
+        if candidates and len(candidates) >= 3:
+            similar_indices = candidates[:20]
+        else:
+            # 2단계: 모델까지 매칭
+            model_key = f"{brand}_{model}"
+            model_candidates = self.brand_model_index.get(model_key, [])
             
-            if similar_indices:
-                return similar_indices
-        
-        # 2차: 같은 브랜드 내 다른 모델 (유사한 연식/주행거리)
-        brand_match_df = self.processed_data[
-            self.processed_data['brand'] == auction_item.brand
-        ]
-        
-        if len(brand_match_df) > 0:
-            similar_indices = []
-            for idx, row in brand_match_df.iterrows():
-                year_diff = abs(auction_item.year - row['year'])
-                mileage_diff = abs(auction_item.mileage_km - row['mileage_km'])
-                
-                # 다른 모델이므로 더 엄격한 조건
-                if year_diff <= 1 and mileage_diff <= 20000:
-                    original_idx = self.processed_data.index.get_loc(idx)
-                    similar_indices.append(original_idx)
+            if model_candidates and len(model_candidates) >= 3:
+                filtered = []
+                for idx in model_candidates:
+                    if idx < len(self.processed_data):
+                        row = self.processed_data.iloc[idx]
+                        row_year = row.get('year', 0)
+                        if year == 0 or row_year == 0 or abs(year - row_year) <= 3:
+                            filtered.append(idx)
+                similar_indices = filtered[:15]
             
-            if similar_indices:
-                print(f"⚠️  {auction_item.brand} {auction_item.model}의 정확한 매칭이 없어 동일 브랜드 {len(similar_indices)}개 차량을 참조합니다.")
-                return similar_indices
+            if len(similar_indices) < 3:
+                # 3단계: 브랜드만 매칭
+                brand_candidates = self.brand_only_index.get(brand, [])
+                
+                if brand_candidates:
+                    filtered = []
+                    mileage = auction_item.mileage_km or 50000
+                    
+                    for idx in brand_candidates[:50]:
+                        if idx < len(self.processed_data):
+                            row = self.processed_data.iloc[idx]
+                            row_year = row.get('year', 0)
+                            row_mileage = row.get('mileage_km', 50000)
+                            
+                            year_ok = year == 0 or row_year == 0 or abs(year - row_year) <= 5
+                            mileage_ok = abs(mileage - row_mileage) <= 50000
+                            
+                            if year_ok and mileage_ok:
+                                filtered.append(idx)
+                    
+                    similar_indices.extend(filtered[:10])
         
-        # 3차: 전체 데이터에서 유사한 연식의 차량 (최후의 수단)
-        fallback_df = self.processed_data[
-            abs(self.processed_data['year'] - auction_item.year) <= 1
-        ]
+        if not similar_indices and brand in self.brand_only_index:
+            similar_indices = self.brand_only_index[brand][:5]
         
-        if len(fallback_df) > 0:
-            # 무작위로 최대 10개 샘플 선택
-            sample_size = min(10, len(fallback_df))
-            sampled_indices = fallback_df.sample(n=sample_size).index.tolist()
-            print(f"⚠️  {auction_item.brand} {auction_item.model}의 유사 데이터가 없어 동일 연식 {sample_size}개 차량을 참조합니다.")
-            return [self.processed_data.index.get_loc(idx) for idx in sampled_indices]
+        if len(self._similarity_cache) >= self.config['cache_size']:
+            old_keys = list(self._similarity_cache.keys())[:-self.config['cache_size']//2]
+            for old_key in old_keys:
+                del self._similarity_cache[old_key]
         
-        print(f"⚠️  {auction_item.brand} {auction_item.model}의 참조 데이터가 전혀 없습니다. 기본 전략을 사용합니다.")
-        return []
+        self._similarity_cache[cache_key] = similar_indices
+        return similar_indices
     
     def _calculate_win_probability(self, auction_item: AuctionItem, bid_price: float) -> float:
-        """입찰 성공 확률 계산"""
+        """승률 계산"""
+        cache_key = f"{auction_item.listing_id}_{int(bid_price)}"
+        
+        if cache_key in self._probability_cache:
+            return self._probability_cache[cache_key]
+        
         similar_indices = self._find_similar_cars(auction_item)
         
         if not similar_indices:
-            # 참조 데이터가 전혀 없는 경우: 보수적이지만 합리적인 확률 모델
-            price_ratio = bid_price / auction_item.min_price
+            min_price = auction_item.min_price or 1000000
+            price_ratio = bid_price / min_price
+            if price_ratio >= 1.25:
+                prob = 0.85
+            elif price_ratio >= 1.15:
+                prob = 0.70
+            elif price_ratio >= 1.12:
+                prob = 0.55
+            elif price_ratio >= 1.07:
+                prob = 0.40
+            elif price_ratio >= 1.05:
+                prob = 0.25
+            else:
+                prob = 0.15
+        else:
+            sample_size = min(10, len(similar_indices))
+            sampled_indices = random.sample(similar_indices, sample_size)
             
-            # 시장 일반론 기반 확률 (경험적 모델)
-            if price_ratio >= 1.6:      # 최소가의 160% 이상
-                return 0.85
-            elif price_ratio >= 1.4:    # 140% 이상  
-                return 0.70
-            elif price_ratio >= 1.25:   # 125% 이상
-                return 0.55
-            elif price_ratio >= 1.15:   # 115% 이상
-                return 0.40
-            elif price_ratio >= 1.05:   # 105% 이상
-                return 0.25
-            else:                       # 최소가 근처
-                return 0.15
-        
-        # 유사 차량들의 가격 데이터로 확률 계산
-        all_prices = []
-        all_weights = []
-        
-        for idx in similar_indices:
-            car_info = self.processed_data.iloc[idx]
-            price_list = car_info['price_list']
-            date_list = car_info['date_list']
-            time_weights = self._calculate_time_weights(date_list)
+            all_prices = []
+            for idx in sampled_indices:
+                if idx < len(self.processed_data):
+                    car_info = self.processed_data.iloc[idx]
+                    price_list = car_info.get('price_list', [])
+                    if price_list and isinstance(price_list, list):
+                        all_prices.extend(price_list[:50])
             
-            all_prices.extend(price_list)
-            all_weights.extend(time_weights)
+            if all_prices:
+                success_count = sum(1 for price in all_prices if price <= bid_price)
+                prob = min(success_count / len(all_prices), 0.95)
+            else:
+                prob = 0.3
         
-        if all_prices:
-            weighted_success = 0
-            total_weight = 0
-            
-            for price, weight in zip(all_prices, all_weights):
-                total_weight += weight
-                if price <= bid_price:
-                    weighted_success += weight
-            
-            calculated_prob = weighted_success / total_weight if total_weight > 0 else 0.3
-            return min(calculated_prob, 0.95)  # 최대 95% 제한
-        
-        # fallback
-        return 0.3
+        self._probability_cache[cache_key] = prob
+        return prob
     
     def _apply_action(self, state: AuctionState, action: AuctionAction) -> Tuple[AuctionState, float]:
-        """
-        액션을 적용해서 새로운 상태 생성 - 개별 액션에는 보상 없음 (에피소드 종료시에만 보상)
-        """
-        new_state = deepcopy(state)
-        reward = 0  # 개별 액션에는 보상 없음! 오직 에피소드 종료시에만
+        """액션 적용"""
+        new_state = AuctionState(
+            current_budget=state.current_budget,
+            remaining_targets=state.remaining_targets.copy(),
+            available_auctions=state.available_auctions[1:],
+            current_inventory=state.current_inventory.copy(),
+            time_step=state.time_step + 1,
+            total_auctions=state.total_auctions
+        )
         
-        if not new_state.available_auctions:
-            return new_state, reward
+        if not state.available_auctions:
+            return new_state, 0
         
-        current_auction = new_state.available_auctions[0]
-        model_key = new_state.get_model_key(current_auction)
+        current_auction = state.available_auctions[0]
         
-        # 경매 리스트에서 현재 경매 제거
-        new_state.available_auctions = new_state.available_auctions[1:]
-        new_state.time_step += 1
-        
-        if action.bid_amount == 0:  # Skip
-            # 건너뛰기 - 상태만 변경, 보상 없음
-            pass
-                
-        else:
-            # 입찰 시도
+        if action.bid_amount > 0:
             win_prob = self._calculate_win_probability(current_auction, action.bid_amount)
             
-            if random.random() < win_prob:  # 낙찰 성공
+            if random.random() < win_prob:
                 actual_price = int(action.bid_amount * random.uniform(0.85, 1.0))
-                actual_price = max(actual_price, current_auction.min_price)
+                actual_price = max(actual_price, current_auction.min_price or 0)
                 
-                # 상태 업데이트만 - 보상은 에피소드 끝에서
                 new_state.current_budget -= actual_price
-                new_state.current_inventory[model_key] = new_state.current_inventory.get(model_key, 0) + 1
                 
-                if model_key in new_state.remaining_targets:
-                    new_state.remaining_targets[model_key] = max(0, new_state.remaining_targets[model_key] - 1)
-            # else: 낙찰 실패 - 상태 변화 없음, 보상도 없음
+                if action.target_key and action.target_key in new_state.remaining_targets:
+                    new_state.current_inventory[action.target_key] = new_state.current_inventory.get(action.target_key, 0) + 1
+                    new_state.remaining_targets[action.target_key] = max(0, new_state.remaining_targets[action.target_key] - 1)
+                else:
+                    matching_targets = state.find_matching_targets(current_auction)
+                    if matching_targets:
+                        target_key = matching_targets[0][0]
+                        new_state.current_inventory[target_key] = new_state.current_inventory.get(target_key, 0) + 1
+                        new_state.remaining_targets[target_key] = max(0, new_state.remaining_targets[target_key] - 1)
         
-        return new_state, reward
+        return new_state, 0
     
     def _simulate(self, state: AuctionState) -> float:
-        """
-        시뮬레이션 - 최종 구매 대수만을 기준으로 보상 계산
-        예산 대비 최대한 많은 차량 구매가 목표
-        """
+        """시뮬레이션"""
         current_state = deepcopy(state)
+        simulation_steps = 0
+        max_steps = min(self.config['simulation_length'], len(current_state.available_auctions))
         
-        while not current_state.is_terminal() and len(current_state.available_auctions) > 0:
-            current_auction = current_state.available_auctions[0]
-            model_key = current_state.get_model_key(current_auction)
+        while (not current_state.is_terminal() and 
+               simulation_steps < max_steps and
+               current_state.available_auctions):
             
-            # 목표가 있는 차량에 대해서는 적극적으로 입찰
-            if (model_key in current_state.remaining_targets and 
-                current_state.remaining_targets[model_key] > 0 and
-                current_state.current_budget >= current_auction.min_price):
+            current_auction = current_state.available_auctions[0]
+            matching_targets = current_state.find_matching_targets(current_auction)
+            
+            if (matching_targets and 
+                current_state.current_budget >= (current_auction.min_price or 0)):
                 
-                # 예산 활용도와 남은 경매 수를 고려한 입찰 전략
-                remaining_budget_ratio = current_state.current_budget / state.current_budget
-                remaining_relevant_auctions = len([a for a in current_state.available_auctions 
-                                                 if current_state.get_model_key(a) in current_state.remaining_targets 
-                                                 and current_state.remaining_targets[current_state.get_model_key(a)] > 0])
-                
-                # 예산이 많이 남았고 경매가 적다면 더 공격적으로
-                if remaining_budget_ratio > 0.7 and remaining_relevant_auctions <= 3:
-                    multiplier = random.uniform(1.3, 1.7)  # 공격적
-                elif remaining_budget_ratio > 0.4:
-                    multiplier = random.uniform(1.1, 1.4)  # 보통
-                else:
-                    multiplier = random.uniform(1.0, 1.2)  # 보수적
-                
+                multiplier = random.uniform(1.1, 1.5)
                 max_bid = min(current_state.current_budget, 
-                             int(current_auction.min_price * multiplier))
-                action = AuctionAction(current_auction.listing_id, max_bid, "simulation")
+                             int((current_auction.min_price or 1000000) * multiplier))
+                target_key = matching_targets[0][0]
+                action = AuctionAction(current_auction.listing_id, max_bid, "simulation", target_key)
             else:
-                # 목표가 없거나 예산 부족이면 건너뛰기
                 action = AuctionAction(current_auction.listing_id, 0, "skip")
             
             current_state, _ = self._apply_action(current_state, action)
+            simulation_steps += 1
         
-        # ===== 핵심: 오직 최종 구매 대수만으로 보상 계산 =====
         total_purchased = sum(current_state.current_inventory.values())
+        base_reward = total_purchased * 10.0
         
-        # 기본 보상: 구매한 차량 수에 비례
-        base_reward = total_purchased * 10.0  # 차량 1대당 10점
-        
-        # 목표 달성 보너스
         total_targets = sum(state.remaining_targets.values())
         if total_targets > 0:
             achievement_rate = total_purchased / total_targets
-            if achievement_rate >= 1.0:  # 목표 완전 달성
+            if achievement_rate >= 1.0:
                 achievement_bonus = 50.0
-            elif achievement_rate >= 0.8:  # 80% 이상 달성
+            elif achievement_rate >= 0.8:
                 achievement_bonus = 20.0
-            elif achievement_rate >= 0.6:  # 60% 이상 달성
-                achievement_bonus = 10.0
             else:
                 achievement_bonus = 0
         else:
             achievement_bonus = 0
         
-        # 예산 효율성 보너스 (남은 예산이 적을수록 좋음, 단 구매를 했을 때만)
-        if total_purchased > 0:
-            budget_utilization = 1.0 - (current_state.current_budget / state.current_budget)
-            efficiency_bonus = budget_utilization * 5.0  # 최대 5점
-        else:
-            efficiency_bonus = 0
+        return base_reward + achievement_bonus
+    
+    def _create_purchase_targets(self, purchase_plans: List[Dict]) -> Dict[str, int]:
+        """구매 목표 생성"""
+        targets = {}
         
-        final_reward = base_reward + achievement_bonus + efficiency_bonus
+        for plan in purchase_plans:
+            brand = plan.get('brand', 'any')
+            model = plan.get('model')
+            year = plan.get('year')
+            target_units = plan.get('target_units', 0)
+            
+            if brand and model and year:
+                key = f"{brand}_{model}_{year}"
+            elif brand and model:
+                key = f"{brand}_{model}"
+            elif brand:
+                key = f"{brand}"
+            else:
+                key = "any"
+            
+            targets[key] = targets.get(key, 0) + target_units
         
-        return final_reward
+        return targets
+    
+    def _prioritize_auctions(self, auctions: List[AuctionItem], targets: Dict[str, int]) -> List[AuctionItem]:
+        """경매 우선순위 정렬"""
+        def get_priority(auction):
+            matching_targets = []
+            for target_key, target_count in targets.items():
+                if target_count <= 0:
+                    continue
+                    
+                if self._matches_target(auction, target_key):
+                    if "_" in target_key:
+                        parts = target_key.split("_")
+                        if len(parts) == 3:
+                            weight = 100
+                        elif len(parts) == 2:
+                            weight = 80
+                        else:
+                            weight = 60
+                    else:
+                        weight = 40
+                        
+                    priority = target_count * weight
+                    matching_targets.append(priority)
+            
+            if not matching_targets:
+                return 0
+                
+            max_priority = max(matching_targets)
+            price_priority = 1000000 / max(auction.min_price or 1000000, 1)
+            
+            return max_priority + price_priority
+        
+        return sorted(auctions, key=get_priority, reverse=True)
+    
+    def _matches_target(self, auction: AuctionItem, target_key: str) -> bool:
+        """경매 아이템이 목표와 매칭되는지 확인"""
+        if target_key == "any":
+            return True
+            
+        parts = target_key.split("_")
+        auction_brand = auction.brand or "unknown"
+        auction_model = auction.model or "any" 
+        auction_year = auction.year or 0
+        
+        if len(parts) == 1:
+            return auction_brand == parts[0]
+        elif len(parts) == 2:
+            return (auction_brand == parts[0] and 
+                   (auction_model == parts[1] or parts[1] == "any"))
+        elif len(parts) == 3:
+            return (auction_brand == parts[0] and 
+                   (auction_model == parts[1] or parts[1] == "any") and
+                   (auction_year == int(parts[2]) or int(parts[2]) == 0))
+        
+        return False
     
     def mcts_search(self, initial_state: AuctionState, iterations: int = 1000) -> MCTSNode:
-        """MCTS 검색 실행"""
+        """MCTS 검색"""
+        initial_state.available_auctions = self._prioritize_auctions(
+            initial_state.available_auctions, initial_state.remaining_targets
+        )
+        
+        if len(initial_state.available_auctions) > self.config['lookahead_window']:
+            windowed_auctions = initial_state.available_auctions[:self.config['lookahead_window']]
+            initial_state.available_auctions = windowed_auctions
+            logger.info(f"Lookahead window 적용: {len(windowed_auctions)}개 경매로 제한")
+        
         root = MCTSNode(initial_state, optimizer=self)
-
-        print(f"[MCTS] Search start - iterations={iterations}")
-        for i in range(iterations):
-            # 1. Selection
-            node = root
-            while not node.state.is_terminal() and node.is_fully_expanded() and node.children:
-                node = node.best_child()
+        
+        if self.config['adaptive_iterations']:
+            auction_count = len(initial_state.available_auctions)
+            base_iter = iterations
             
-            # 2. Expansion
-            if not node.state.is_terminal() and not node.is_fully_expanded():
+            if auction_count > 200:
+                scale_factor = max(0.3, math.log10(200) / math.log10(auction_count))
+                iterations = max(500, int(base_iter * scale_factor))
+            elif auction_count > 100:
+                scale_factor = max(0.7, 100 / auction_count)
+                iterations = max(800, int(base_iter * scale_factor))
+            else:
+                iterations = min(base_iter, 2000)
+        
+        logger.info(f"MCTS 검색 시작 - iterations={iterations}, auctions={len(initial_state.available_auctions)}")
+    
+        progress_interval = iterations
+        
+        for i in range(iterations):
+            if i % 100 == 0 and i > 0:
+                if len(self._similarity_cache) > self.config['cache_size']:
+                    old_keys = list(self._similarity_cache.keys())[:-self.config['cache_size']//2]
+                    for key in old_keys:
+                        del self._similarity_cache[key]
+            
+            # Selection
+            node = root
+            depth = 0
+            while (not node.state.is_terminal() and 
+                   node.is_fully_expanded() and 
+                   node.children and 
+                   depth < self.config['max_tree_depth']):
+                node = node.best_child()
+                depth += 1
+            
+            # Expansion
+            if (not node.state.is_terminal() and 
+                not node.is_fully_expanded() and
+                depth < self.config['max_tree_depth']):
                 if node.untried_actions:
                     action = random.choice(node.untried_actions)
                     node.untried_actions.remove(action)
                     new_state, _ = self._apply_action(node.state, action)
                     node = node.add_child(action, new_state)
             
-            # 3. Simulation
+            # Simulation
             reward = self._simulate(node.state)
             
-            # 4. Backpropagation
+            # Backpropagation
             while node is not None:
                 node.visits += 1
                 node.total_reward += reward
                 node = node.parent
+            
+            if (i + 1) % progress_interval == 0:
+                cache_hit_rate = self._cache_hits / max(self._cache_hits + self._cache_misses, 1) * 100
+                logger.info(f"MCTS 진행: {i+1}/{iterations} ({(i+1)/iterations*100:.1f}%) "
+                           f"- 캐시 적중률: {cache_hit_rate:.1f}%")
 
-            # 로그
-            if (i + 1) % 500 == 0 or (i + 1) == iterations:
-                avg_reward = root.total_reward / root.visits if root.visits > 0 else 0
-                best_child = max(root.children, key=lambda c: c.visits) if root.children else None
-                best_action = (
-                    f"{best_child.action.action_type}({best_child.action.bid_amount:,})"
-                    if best_child else "N/A"
-                )
-                print(f"[MCTS] iter={i+1}/{iterations}, visits={root.visits}, "
-                      f"children={len(root.children)}, avgR={avg_reward:.2f}, best={best_action}")
-
-        print(f"[MCTS 검색 완료] Root visits={root.visits}, children={len(root.children)}")
-        if root.children:
-            best_child = max(root.children, key=lambda c: c.visits)
-            bid_info = f"bid={best_child.action.bid_amount:,}" if best_child.action.bid_amount > 0 else "skip"
-            print(f"[MCTS] Best child: {best_child.action.action_type} ({bid_info}), visits={best_child.visits}")
-
+        logger.info(f"MCTS 검색 완료 - Root visits={root.visits}, children={len(root.children)}")
         return root
     
-    def get_best_action_sequence(self, root: MCTSNode, max_depth: int = 10) -> List[AuctionAction]:
+    def get_best_action_sequence(self, root: MCTSNode, max_depth: int = None) -> List[AuctionAction]:
         """최적 액션 시퀀스 추출"""
+        if max_depth is None:
+            max_depth = min(20, len(root.state.available_auctions))
+        
         sequence = []
         node = root
         depth = 0
         
         while node.children and depth < max_depth:
-            # 가장 많이 방문된 자식 노드 선택
             best_child = max(node.children, key=lambda child: child.visits)
             if best_child.action:
                 sequence.append(best_child.action)
@@ -549,181 +700,362 @@ class MCTSAuctionOptimizer:
         return sequence
     
     def optimize_auction_strategy(self, optimization_input: Dict, iterations: int = 1000) -> Dict:
-        """MCTS를 사용한 경매 전략 최적화 - 목표 달성 중심"""
+        """경매 전략 최적화"""
+        start_time = datetime.now()
         
-        # 입력 데이터 파싱
-        budget = optimization_input['budget']
-        purchase_plans = optimization_input['purchase_plans']
-        auction_schedule = optimization_input['auction_schedule']
+        budget = optimization_input.get('budget', 0)
+        purchase_plans = optimization_input.get('purchase_plans', [])
+        auction_schedule = optimization_input.get('auction_schedule', [])
         
-        # 구매 목표 설정
-        remaining_targets = {}
-        for plan in purchase_plans:
-            key = f"{plan['brand']}_{plan['model']}_{plan['year']}"
-            remaining_targets[key] = plan['target_units']
+        logger.info(f"최적화 시작 - 예산: {budget:,}원, 경매: {len(auction_schedule)}개")
+        
+        remaining_targets = self._create_purchase_targets(purchase_plans)
+        logger.info(f"구매 목표: {remaining_targets}")
         
         # 경매 아이템 생성
-        available_auctions = []
-        for item in auction_schedule:
+        all_auctions = []
+        for i, item in enumerate(auction_schedule):
             auction_item = AuctionItem(
-                listing_id=item.get('listing_id', f"auction_{len(available_auctions)}"),
+                listing_id=item.get('listing_id', f"auction_{i}"),
                 brand=item.get('brand'),
                 model=item.get('model'),
                 year=item.get('year'),
                 mileage_km=item.get('mileage_km'),
                 auction_house=item.get('auction_house'),
-                min_price=item.get('min_price'),
+                min_price=item.get('min_price', 0),
                 date=item.get('date'),
                 transmission=item.get('transmission'),
                 fuel=item.get('fuel'),
                 color=item.get('color'),
                 displacement_cc=item.get('displacement_cc')
             )
-            available_auctions.append(auction_item)
+            all_auctions.append(auction_item)
         
-        # 초기 상태 생성
-        initial_state = AuctionState(
-            current_budget=budget,
-            remaining_targets=remaining_targets,
-            available_auctions=available_auctions,
-            current_inventory={},
-            time_step=0
-        )
+        all_auctions = self._prioritize_auctions(all_auctions, remaining_targets)
         
-        print(f"MCTS 검색 시작 - {iterations}회 반복")
-        print(f"초기 예산: {budget:,}원")
-        print(f"구매 목표: {remaining_targets}")
-        print(f"경매 일정: {len(available_auctions)}개")
+        # Rolling Horizon 처리
+        current_budget = budget
+        current_inventory = {}
+        all_executed_actions = []
+        processed_auctions = 0
         
-        # MCTS 검색 실행
-        root = self.mcts_search(initial_state, iterations)
+        window_size = self.config['lookahead_window']
+        total_batches = (len(all_auctions) + window_size - 1) // window_size
         
-        # 최적 액션 시퀀스 추출
-        best_actions = self.get_best_action_sequence(root)
+        logger.info(f"Rolling Horizon 처리: {total_batches}개 배치로 분할")
         
-        # 결과를 여러 번 시뮬레이션해서 평균적인 성과 계산 (확률적 요소 때문)
-        simulation_results = []
-        for sim_run in range(100):  # 100번 시뮬레이션
-            sim_state = deepcopy(initial_state)
-            sim_executed_actions = []
-            sim_total_cost = 0
+        for batch_idx in range(total_batches):
+            start_idx = batch_idx * window_size
+            end_idx = min((batch_idx + 1) * window_size, len(all_auctions))
+            current_batch = all_auctions[start_idx:end_idx]
             
-            for action in best_actions:
-                if sim_state.is_terminal() or not sim_state.available_auctions:
-                    break
+            if not current_batch or current_budget <= 0:
+                break
+
+            if total_batches <= 10:
+                batch_iterations = max(1000, iterations // 2)
+            elif total_batches <= 50:
+                batch_iterations = max(600, iterations // 3)
+            elif total_batches <= 200:
+                batch_iterations = max(400, iterations // 5)
+            else:
+                batch_iterations = max(300, iterations // 8)
+            
+            if batch_idx < min(5, total_batches // 4):
+                batch_iterations = int(batch_iterations * 1.5)
+                
+            logger.info(f"배치 {batch_idx + 1}/{total_batches} 처리 중... "
+                       f"({len(current_batch)}개 경매, 예산: {current_budget:,}원)")
+            
+            batch_state = AuctionState(
+                current_budget=current_budget,
+                remaining_targets=remaining_targets.copy(),
+                available_auctions=current_batch,
+                current_inventory=current_inventory.copy(),
+                time_step=processed_auctions,
+                total_auctions=len(all_auctions)
+            )
+            
+            batch_root = self.mcts_search(batch_state, batch_iterations)
+            batch_actions = self.get_best_action_sequence(batch_root, len(current_batch))
+            
+            # 시뮬레이션
+            batch_simulation_runs = 20
+            batch_results = []
+            
+            for _ in range(batch_simulation_runs):
+                sim_state = deepcopy(batch_state)
+                sim_actions = []
+                sim_cost = 0
+                
+                for action in batch_actions:
+                    if sim_state.is_terminal() or not sim_state.available_auctions:
+                        break
+                        
+                    current_auction = sim_state.available_auctions[0]
                     
-                current_auction = sim_state.available_auctions[0]
-                model_key = sim_state.get_model_key(current_auction)
+                    if action.bid_amount > 0:
+                        win_prob = self._calculate_win_probability(current_auction, action.bid_amount)
+                        if random.random() < win_prob:
+                            actual_price = int(action.bid_amount * random.uniform(0.85, 1.0))
+                            actual_price = max(actual_price, current_auction.min_price or 0)
+                            
+                            sim_actions.append({
+                                'auction_house': current_auction.auction_house or 'unknown',
+                                'listing_id': current_auction.listing_id,
+                                'brand': current_auction.brand or 'unknown',
+                                'model': current_auction.model or 'any',
+                                'year': current_auction.year or 0,
+                                'max_bid_price': action.bid_amount,
+                                'expected_price': actual_price,
+                                'auction_end_date': current_auction.date,
+                                'action_type': action.action_type,
+                                'target_key': action.target_key,
+                                'win_probability': round(win_prob, 3)
+                            })
+                            
+                            sim_cost += actual_price
+                    
+                    sim_state, _ = self._apply_action(sim_state, action)
                 
-                # 액션 실행
-                if action.bid_amount > 0:
-                    win_prob = self._calculate_win_probability(current_auction, action.bid_amount)
-                    if random.random() < win_prob:
-                        actual_price = int(action.bid_amount * random.uniform(0.85, 1.0))
-                        actual_price = max(actual_price, current_auction.min_price)
-                        
-                        sim_executed_actions.append({
-                            'auction_house': current_auction.auction_house,
-                            'listing_id': current_auction.listing_id,
-                            'max_bid_price': action.bid_amount,
-                            'expected_price': actual_price,
-                            'auction_end_date': current_auction.date,
-                            'action_type': action.action_type,
-                            'win_probability': win_prob
-                        })
-                        
-                        sim_total_cost += actual_price
-                
-                sim_state, _ = self._apply_action(sim_state, action)
+                batch_results.append({
+                    'actions': sim_actions,
+                    'cost': sim_cost,
+                    'inventory': dict(sim_state.current_inventory)
+                })
             
-            sim_total_purchased = sum(sim_state.current_inventory.values())
-            simulation_results.append({
-                'purchased': sim_total_purchased,
-                'cost': sim_total_cost,
-                'actions': sim_executed_actions,
-                'inventory': dict(sim_state.current_inventory)
-            })
+            # 최적 배치 결과 선택
+            avg_cost = np.mean([r['cost'] for r in batch_results])
+            best_result_idx = min(range(len(batch_results)), 
+                                key=lambda i: abs(batch_results[i]['cost'] - avg_cost))
+            best_batch_result = batch_results[best_result_idx]
+            
+            # 전체 상태 업데이트
+            all_executed_actions.extend(best_batch_result['actions'])
+            current_budget -= best_batch_result['cost']
+            
+            for model_key, count in best_batch_result['inventory'].items():
+                purchased_in_batch = count - current_inventory.get(model_key, 0)
+                current_inventory[model_key] = count
+                
+                if model_key in remaining_targets:
+                    remaining_targets[model_key] = max(0, remaining_targets[model_key] - purchased_in_batch)
+            
+            processed_auctions += len(current_batch)
+            
+            logger.info(f"배치 {batch_idx + 1} 완료: {len(best_batch_result['actions'])}개 낙찰, "
+                       f"비용: {best_batch_result['cost']:,}원, 남은 예산: {current_budget:,}원")
+            
+            if current_inventory:
+                inventory_summary = ", ".join(
+                    f"{model_key}: {count}대" for model_key, count in current_inventory.items()
+                )
+                logger.info(f"누적 구매 현황: {inventory_summary}")
+
+            if sum(remaining_targets.values()) <= 0 or current_budget <= 0:
+                logger.info(f"조기 종료: 목표 달성 또는 예산 소진")
+                break
         
-        # 시뮬레이션 결과 통계 계산
-        avg_purchased = np.mean([r['purchased'] for r in simulation_results])
-        avg_cost = np.mean([r['cost'] for r in simulation_results])
+        # 최종 결과 계산
+        final_purchased = sum(current_inventory.values())
+        final_cost = budget - current_budget
         
-        # 가장 대표적인 시뮬레이션 결과 선택 (평균에 가장 가까운 것)
-        best_sim_idx = min(range(len(simulation_results)), 
-                          key=lambda i: abs(simulation_results[i]['purchased'] - avg_purchased))
-        best_simulation = simulation_results[best_sim_idx]
+        total_targets = sum([plan['target_units'] for plan in purchase_plans])
+        success_rate = final_purchased / total_targets if total_targets > 0 else 0
         
-        # 목표 달성률 계산
-        total_targets = sum(remaining_targets.values())
-        success_rate = avg_purchased / total_targets if total_targets > 0 else 0
+        end_time = datetime.now()
+        processing_time = (end_time - start_time).total_seconds()
+        
+        cache_hit_rate = self._cache_hits / max(self._cache_hits + self._cache_misses, 1) * 100
         
         message = textwrap.dedent(f"""
-            [MCTS 최적화 완료]
-            - 루트 노드 방문 횟수: {root.visits}
-            - 루트 노드 평균 보상: {root.total_reward / root.visits:.3f}
-            - 최적 액션 시퀀스 길이: {len(best_actions)}
-            - 100회 시뮬레이션 평균 구매: {avg_purchased:.1f}대
+            [Rolling Horizon MCTS 최적화 완료]
+            - 처리 시간: {processing_time:.1f}초
+            - 전체 경매 수: {len(auction_schedule)}개 (모두 처리)
+            - 처리된 배치 수: {min(total_batches, batch_idx + 1)}개
+            - 총 구매 차량: {final_purchased}대
+            - 총 사용 예산: {final_cost:,}원
             - 목표 달성률: {success_rate * 100:.1f}%
+            - 예산 활용률: {(final_cost / budget) * 100:.1f}%
+            - 캐시 적중률: {cache_hit_rate:.1f}%
+            - 실행된 액션 수: {len(all_executed_actions)}개
         """)
 
-        print(message)
+        logger.info(message)
 
-        # 목표 달성률이 낮으면 경고
         if success_rate < 0.8:
             alert_message = textwrap.dedent(f"""
-                ⚠️  목표 달성률이 {success_rate * 100:.1f}%로 낮습니다. 예산 증액을 고려해보세요
+                ⚠️  목표 달성률이 {success_rate * 100:.1f}%로 낮습니다. 예산 증액이나 더 많은 경매 참여를 고려해보세요.
             """)
-            print(alert_message)
+            logger.warning(alert_message)
             message += alert_message
 
         return {
             'message': message,
-            'expected_purchase_units': int(avg_purchased),
-            'total_expected_cost': int(avg_cost),
+            'expected_purchase_units': final_purchased,
+            'total_expected_cost': final_cost,
             'success_rate': round(success_rate * 100, 2),
-            'budget_utilization': round((avg_cost / budget) * 100, 2),
-            'auction_list': best_simulation['actions'],
-            'purchase_breakdown': best_simulation['inventory'],
+            'budget_utilization': round((final_cost / budget) * 100, 2),
+            'auction_list': all_executed_actions,
+            'purchase_breakdown': current_inventory,
+            'targets': remaining_targets,
+            'processing_stats': {
+                'processing_time_seconds': round(processing_time, 2),
+                'total_auctions': len(auction_schedule),
+                'processed_batches': min(total_batches, batch_idx + 1),
+                'cache_hit_rate': round(cache_hit_rate, 2),
+                'total_actions_executed': len(all_executed_actions),
+            },
             'mcts_stats': {
-                'root_visits': root.visits,
-                'root_avg_reward': root.total_reward / root.visits if root.visits > 0 else 0,
-                'best_sequence_length': len(best_actions),
                 'total_iterations': iterations,
-                'simulation_runs': 100
+                'batches_processed': min(total_batches, batch_idx + 1),
+                'max_tree_depth': self.config['max_tree_depth'],
+                'lookahead_window': self.config['lookahead_window'],
+                'rolling_horizon': True,
             }
         }
 
-# 사용 예시 및 테스트
+class ReoptimizationMCTSOptimizer(MCTSAuctionOptimizer):
+    """재최적화를 위한 MCTS 옵티마이저"""
+    
+    def analyze_bid_performance(self, executed_bids: List, current_inventory: Dict[str, int]) -> Dict:
+        """입찰 성과 분석"""
+        if not executed_bids:
+            return {"message": "실행된 입찰이 없습니다."}
+            
+        total_bids = len(executed_bids)
+        won_bids = [bid for bid in executed_bids if bid.get('actual_result') == "won"]
+        lost_bids = [bid for bid in executed_bids if bid.get('actual_result') == "lost"] 
+        pending_bids = [bid for bid in executed_bids if bid.get('actual_result') == "pending"]
+        
+        win_rate = len(won_bids) / total_bids if total_bids > 0 else 0
+        
+        total_spent = sum(bid.get('actual_price', 0) for bid in won_bids)
+        expected_total = sum(bid.get('expected_price', 0) for bid in executed_bids)
+        cost_efficiency = total_spent / expected_total if expected_total > 0 else 0
+        
+        # 브랜드별 성과 분석
+        brand_performance = defaultdict(lambda: {'won': 0, 'lost': 0, 'spent': 0})
+        for bid in executed_bids:
+            brand = bid.get('brand', 'unknown')
+            if bid.get('actual_result') == "won":
+                brand_performance[brand]['won'] += 1
+                brand_performance[brand]['spent'] += bid.get('actual_price', 0)
+            elif bid.get('actual_result') == "lost":
+                brand_performance[brand]['lost'] += 1
+        
+        return {
+            "total_bids": total_bids,
+            "won_bids": len(won_bids),
+            "lost_bids": len(lost_bids), 
+            "pending_bids": len(pending_bids),
+            "win_rate": round(win_rate * 100, 2),
+            "total_spent": total_spent,
+            "expected_total": expected_total,
+            "cost_efficiency": round(cost_efficiency * 100, 2),
+            "brand_performance": dict(brand_performance),
+            "current_inventory": current_inventory,
+            "won_vehicles": [
+                {
+                    "auction_house": bid.get('auction_house', 'unknown'),
+                    "listing_id": bid.get('listing_id'),
+                    "brand": bid.get('brand', 'unknown'),
+                    "model": bid.get('model', 'any'),
+                    "year": bid.get('year', 0),
+                    "expected_price": bid.get('expected_price', 0),
+                    "actual_price": bid.get('actual_price', 0),
+                    "savings": bid.get('expected_price', 0) - bid.get('actual_price', 0)
+                }
+                for bid in won_bids
+            ]
+        }
+    
+    def reoptimize_strategy(self, reopt_input: Dict, iterations: int = 3000) -> Dict:
+        """재최적화"""
+        start_time = datetime.now()
+        
+        remaining_budget = reopt_input.get('remaining_budget', 0)
+        remaining_auction_schedule = reopt_input.get('remaining_auction_schedule', [])
+        executed_bids = reopt_input.get('executed_bids', [])
+        current_inventory = reopt_input.get('current_inventory', {})
+        remaining_targets = reopt_input.get('remaining_targets', {})
+        
+        logger.info(f"재최적화 시작 - 남은 예산: {remaining_budget:,}원, "
+                   f"남은 경매: {len(remaining_auction_schedule)}개")
+        
+        performance_analysis = self.analyze_bid_performance(executed_bids, current_inventory)
+        
+        optimization_input = {
+            "budget": remaining_budget,
+            "purchase_plans": [
+                {
+                    "brand": key.split("_")[0] if "_" in key else key,
+                    "model": key.split("_")[1] if len(key.split("_")) > 1 else None,
+                    "year": int(key.split("_")[2]) if len(key.split("_")) > 2 else None,
+                    "target_units": target_count
+                }
+                for key, target_count in remaining_targets.items()
+                if target_count > 0
+            ],
+            "auction_schedule": remaining_auction_schedule
+        }
+        
+        optimization_result = self.optimize_auction_strategy(optimization_input, iterations)
+        
+        end_time = datetime.now()
+        processing_time = (end_time - start_time).total_seconds()
+        
+        reoptimization_message = textwrap.dedent(f"""
+            [재최적화 완료]
+            - 처리 시간: {processing_time:.1f}초
+            - 기존 입찰 성과: 승률 {performance_analysis.get('win_rate', 0):.1f}%
+            - 추가 구매 예상: {optimization_result.get('expected_purchase_units', 0)}대
+        """)
+        
+        logger.info(reoptimization_message)
+        
+        return {
+            "message": reoptimization_message,
+            "performance_analysis": performance_analysis,
+            "reoptimization_result": optimization_result,
+            "processing_stats": {
+                "processing_time_seconds": round(processing_time, 2),
+                "remaining_auctions": len(remaining_auction_schedule),
+                "executed_bids": len(executed_bids),
+            }
+        }
+
+# 사용 예시
 if __name__ == "__main__":
-    # 향상된 테스트를 위한 샘플 데이터
+    logger.info("\n" + "=" * 70)
+    logger.info("MCTS 경매 최적화 시스템 테스트")
+    logger.info("=" * 70)
+    
+    # 기본 샘플 데이터
     np.random.seed(42)
     random.seed(42)
-
-    # 실제 CSV 파일 로드
-    # history_data = pd.read_csv("auction_results.csv")
     
-    # 테스트용 샘플 데이터 생성
     sample_data = []
     brands_models = [
         ('현대', '아반떼'), ('기아', 'K5'), ('현대', '소나타'), 
-        ('기아', '스포티지'), ('현대', '투싼')
+        ('기아', '스포티지'), ('현대', '투싼'), ('삼성', None), ('르노', None)
     ]
     
-    for _ in range(3000):
+    for _ in range(1000):
         brand, model = random.choice(brands_models)
-        year = random.choice([2020, 2021, 2022, 2023])
-        mileage = random.randint(10000, 80000)
+        year = random.choice([2020, 2021, 2022, 2023, None])
+        mileage = random.randint(10000, 80000) if random.random() > 0.1 else None
         
-        base_price = {
-            ('현대', '아반떼'): 15000000,
-            ('기아', 'K5'): 18000000,
-            ('현대', '소나타'): 20000000,
-            ('기아', '스포티지'): 25000000,
-            ('현대', '투싼'): 23000000
-        }[brand, model]
+        base_price = 20000000  # 기본 가격
+        if model:
+            model_prices = {
+                '아반떼': 15000000, 'K5': 18000000, '소나타': 20000000,
+                '스포티지': 25000000, '투싼': 23000000
+            }
+            base_price = model_prices.get(model, 20000000)
         
-        age_discount = (2024 - year) * 0.1
-        mileage_discount = (mileage / 100000) * 0.15
+        age_discount = ((2024 - (year or 2022)) * 0.1) if year else 0.1
+        mileage_discount = ((mileage or 50000) / 100000) * 0.15
         price = int(base_price * (1 - age_discount - mileage_discount) * random.uniform(0.85, 1.15))
         
         sample_data.append({
@@ -731,10 +1063,10 @@ if __name__ == "__main__":
             'model': model,
             'year': year,
             'mileage_km': mileage,
-            'transmission': random.choice(['오토', '수동']),
-            'fuel': random.choice(['가솔린', '디젤', '하이브리드']),
-            'color': random.choice(['흰색', '검정', '은색', '회색']),
-            'displacement_cc': random.choice([1600, 2000, 2400]),
+            'transmission': random.choice(['오토', '수동', None]),
+            'fuel': random.choice(['가솔린', '디젤', '하이브리드', None]),
+            'color': random.choice(['흰색', '검정', '은색', '회색', None]),
+            'displacement_cc': random.choice([1600, 2000, 2400, None]),
             'auction_house': random.choice(['오토허브', '엔카오토', '케이카']),
             'winning_price': price,
             'auction_date': datetime.now() - timedelta(days=random.randint(1, 365))
@@ -742,80 +1074,61 @@ if __name__ == "__main__":
     
     history_data = pd.DataFrame(sample_data)
     
-    # MCTS 최적화 시스템 초기화
+    # 최적화 시스템 초기화
     optimizer = MCTSAuctionOptimizer(history_data)
-
+    
+    # 최적화 입력 (일부 정보 누락)
     optimization_input = {
-        'month': '2025-08-25',
-        'budget': 100000000,  # 1억원
+        'budget': 100000000,
         'purchase_plans': [
-            {'brand': '현대', 'model': '아반떼', 'year': 2023, 'target_units': 3},
-            {'brand': '기아', 'model': 'K5', 'year': 2022, 'target_units': 2}
+            {'brand': '현대', 'target_units': 5},
+            {'brand': '기아', 'model': 'K5', 'target_units': 3},
+            {'brand': '삼성', 'target_units': 2},
         ],
         'auction_schedule': [
             {
-                'listing_id': 'hub001',
-                'brand': '현대', 'model': '아반떼', 'year': 2023,
-                'mileage_km': 25000, 'auction_house': '오토허브',
-                'min_price': 12000000, 'date': '2025-09-01',
-                'transmission': '오토', 'fuel': '가솔린', 'color': '흰색'
+                'listing_id': 'auction001',
+                'brand': '현대',
+                'mileage_km': None,
+                'auction_house': '오토허브',
+                'min_price': 12000000,
+                'date': '2025-09-01'
             },
             {
-                'listing_id': 'encar002',
-                'brand': '현대', 'model': '아반떼', 'year': 2023,
-                'mileage_km': 18000, 'auction_house': '엔카오토',
-                'min_price': 13500000, 'date': '2025-09-02',
-                'transmission': '오토', 'fuel': '가솔린', 'color': '검정'
+                'listing_id': 'auction002', 
+                'brand': '현대',
+                'model': '아반떼',
+                'mileage_km': 25000,
+                'auction_house': '엔카오토',
+                'min_price': 13500000,
+                'date': '2025-09-02'
             },
             {
-                'listing_id': 'kcar003',
-                'brand': '기아', 'model': 'K5', 'year': 2022,
-                'mileage_km': 32000, 'auction_house': '케이카',
-                'min_price': 15000000, 'date': '2025-09-03',
-                'transmission': '오토', 'fuel': '가솔린', 'color': '은색'
+                'listing_id': 'auction003',
+                'brand': '기아',
+                'model': 'K5',
+                'year': 2022,
+                'mileage_km': 32000,
+                'auction_house': '케이카',
+                'min_price': 15000000,
+                'date': '2025-09-03'
             },
             {
-                'listing_id': 'hub004',
-                'brand': '현대', 'model': '아반떼', 'year': 2023,
-                'mileage_km': 28000, 'auction_house': '오토허브',
-                'min_price': 11800000, 'date': '2025-09-04',
-                'transmission': '오토', 'fuel': '가솔린', 'color': '회색'
-            },
-            {
-                'listing_id': 'encar005',
-                'brand': '기아', 'model': 'K5', 'year': 2022,
-                'mileage_km': 29000, 'auction_house': '엔카오토',
-                'min_price': 14800000, 'date': '2025-09-05',
-                'transmission': '오토', 'fuel': '디젤', 'color': '흰색'
-            },
-            {
-                'listing_id': 'hub006',
-                'brand': '현대', 'model': '아반떼', 'year': 2023,
-                'mileage_km': 22000, 'auction_house': '오토허브',
-                'min_price': 12500000, 'date': '2025-09-06',
-                'transmission': '오토', 'fuel': '가솔린', 'color': '파랑'
-            },
-            {
-                'listing_id': 'kcar007',
-                'brand': '기아', 'model': 'K5', 'year': 2022,
-                'mileage_km': 35000, 'auction_house': '케이카',
-                'min_price': 14500000, 'date': '2025-09-07',
-                'transmission': '오토', 'fuel': '가솔린', 'color': '회색'
+                'listing_id': 'auction004',
+                'brand': '삼성',
+                'mileage_km': 40000,
+                'auction_house': '오토허브',
+                'min_price': 18000000,
+                'date': '2025-09-04'
             }
         ]
     }
     
-    # MCTS 최적화 실행
-    print("=" * 60)
-    print("MCTS 기반 중고차 경매 최적화 시작")
-    print("=" * 60)
-    
+    logger.info("최적화 테스트 시작...")
     result = optimizer.optimize_auction_strategy(
         optimization_input=optimization_input,
-        iterations=2000
+        iterations=500
     )
     
-    print("\n" + "=" * 60)
-    print("최적화 결과")
-    print("=" * 60)
+    logger.info("\n최적화 결과:")
     print(json.dumps(result, indent=2, ensure_ascii=False))
